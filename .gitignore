@@ -1,3 +1,5 @@
 quorum.env
 quorum_state.json
 quorum_mailbox.log
+quorum_audit.log
+__pycache__/

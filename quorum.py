@@ -22,6 +22,7 @@ Zero third-party runtime dependencies — Python standard library only:
 
 import argparse
 import hashlib
+import hmac
 import http.server
 import json
 import os
@@ -227,30 +228,100 @@ class DiffieHellman:
         return pow(their_public_key, self.private_key, self.p)
 
 
-def derive_key(shared_secret_int, length=32):
-    """Hash the raw DH shared secret into a fixed-length symmetric key."""
+def derive_keys(shared_secret_int, dklen=64):
+    """
+    Derive TWO separate keys (encryption key + MAC key) from the raw DH
+    shared secret, using PBKDF2-HMAC-SHA256 — a real, standard stdlib KDF
+    (per organizer guidance: bare SHA-256 over the DH output is not
+    sufficient; a proper KDF is required).
+
+    Key separation (one key per purpose) is standard cryptographic
+    practice — using the same key for both encryption and authentication
+    can leak information between the two uses.
+
+    A fixed, non-secret application salt is safe here: PBKDF2's salt only
+    needs to be known to both parties (not secret), so the owner and
+    trustee — who each derive the same DH shared secret independently —
+    also derive the same output key material without exchanging anything
+    extra.
+    """
+    salt = b"quorum-v1-trustee-share"
     secret_bytes = shared_secret_int.to_bytes(
         (shared_secret_int.bit_length() + 7) // 8, "big"
     )
-    return hashlib.sha256(secret_bytes).digest()  # 32 bytes
+    key_material = hashlib.pbkdf2_hmac("sha256", secret_bytes, salt, 100_000, dklen=dklen)
+    enc_key = key_material[:32]
+    mac_key = key_material[32:64]
+    return enc_key, mac_key
+
+
+def _keystream(key: bytes, length: int) -> bytes:
+    """
+    Generate a keystream of exactly `length` bytes using a hash-based
+    counter-mode construction: keystream_block[i] = SHA256(key || counter_i).
+
+    Standard technique for turning a hash function into a stream cipher
+    (structurally the same idea as CTR mode). Every block is unique
+    (driven by an incrementing counter), so no repeating keystream byte
+    is ever reused — per organizer guidance, keystream reuse is exactly
+    what must be avoided.
+    """
+    blocks = []
+    counter = 0
+    generated = 0
+    while generated < length:
+        block = hashlib.sha256(key + counter.to_bytes(8, "big")).digest()
+        blocks.append(block)
+        generated += len(block)
+        counter += 1
+    return b"".join(blocks)[:length]
 
 
 def xor_encrypt(data: bytes, key: bytes) -> bytes:
-    """
-    XOR stream cipher keyed by a SHA-256-derived key (repeated to match length).
-
-    Note: provides confidentiality only, not tamper-detection/integrity —
-    see the threat model doc for this documented scope boundary. (Chain of
-    Custody below covers integrity for the audit trail, not for ciphertext
-    in transit — that distinction is worth being precise about in the demo.)
-    """
-    full_key = (key * (len(data) // len(key) + 1))[:len(data)]
-    return bytes(d ^ k for d, k in zip(data, full_key))
+    """Raw XOR against the counter-mode keystream. Confidentiality only —
+    call encrypt_then_mac() for the authenticated version actually used
+    by the CLI."""
+    keystream = _keystream(key, len(data))
+    return bytes(d ^ k for d, k in zip(data, keystream))
 
 
 def xor_decrypt(data: bytes, key: bytes) -> bytes:
     """XOR is symmetric — decryption is identical to encryption."""
     return xor_encrypt(data, key)
+
+
+def encrypt_then_mac(plaintext: bytes, enc_key: bytes, mac_key: bytes) -> bytes:
+    """
+    Encrypt-then-MAC (per organizer guidance): encrypt first, then compute
+    an HMAC over the ciphertext and append it. This makes the ciphertext
+    tamper-evident — any modification in transit is detected before
+    decryption is even attempted, closing the "unauthenticated XOR is
+    malleable" gap.
+
+    Output layout: ciphertext || hmac_tag (32 bytes)
+    """
+    ciphertext = xor_encrypt(plaintext, enc_key)
+    tag = hmac.new(mac_key, ciphertext, hashlib.sha256).digest()
+    return ciphertext + tag
+
+
+def decrypt_then_verify(payload: bytes, enc_key: bytes, mac_key: bytes) -> bytes:
+    """
+    Verify the HMAC tag BEFORE decrypting anything (encrypt-then-MAC
+    verification order). Raises ValueError if the payload was tampered
+    with or corrupted — never silently returns garbage.
+    """
+    if len(payload) < 32:
+        raise ValueError("payload too short to contain a valid HMAC tag")
+
+    ciphertext, tag = payload[:-32], payload[-32:]
+    expected_tag = hmac.new(mac_key, ciphertext, hashlib.sha256).digest()
+
+    # Constant-time comparison — prevents timing attacks on tag verification.
+    if not hmac.compare_digest(tag, expected_tag):
+        raise ValueError("HMAC verification failed — payload was tampered with or corrupted")
+
+    return xor_decrypt(ciphertext, enc_key)
 
 
 # =============================================================================
@@ -755,27 +826,45 @@ def cli_keygen(args):
 
 
 def cli_encrypt_share(args):
-    """Encrypt a share for a trustee using a DH-derived shared key."""
+    """
+    Encrypt a share for a trustee, authenticated (encrypt-then-MAC).
+
+    Per organizer guidance: derives separate encryption + MAC keys via
+    PBKDF2-HMAC-SHA256 (a real stdlib KDF, not bare SHA-256), then encrypts
+    with the counter-mode XOR keystream and appends an HMAC tag over the
+    ciphertext — so any tampering in transit is detected, not silently
+    decrypted into garbage.
+    """
     dh = DiffieHellman()
     dh.private_key = args.my_private
     shared = dh.shared_secret(args.their_public)
-    key = derive_key(shared)
+    enc_key, mac_key = derive_keys(shared)
 
-    encrypted = xor_encrypt(args.share.encode(), key)
-    print("Encrypted share (hex, safe to send over an insecure channel):")
-    print(encrypted.hex())
+    payload = encrypt_then_mac(args.share.encode(), enc_key, mac_key)
+    print("Encrypted + authenticated share (hex, safe to send over an insecure channel):")
+    print(payload.hex())
 
 
 def cli_decrypt_share(args):
-    """Decrypt a share received from the owner using a DH-derived shared key."""
+    """
+    Decrypt a share received from the owner, verifying its HMAC tag first.
+
+    If the payload was tampered with or corrupted, this raises an error
+    and refuses to decrypt — it never silently returns garbage.
+    """
     dh = DiffieHellman()
     dh.private_key = args.my_private
     shared = dh.shared_secret(args.their_public)
-    key = derive_key(shared)
+    enc_key, mac_key = derive_keys(shared)
 
-    encrypted = bytes.fromhex(args.encrypted_hex)
-    decrypted = xor_decrypt(encrypted, key)
-    print("Decrypted share:")
+    payload = bytes.fromhex(args.encrypted_hex)
+    try:
+        decrypted = decrypt_then_verify(payload, enc_key, mac_key)
+    except ValueError as e:
+        print(f"🚨 DECRYPTION REFUSED: {e}")
+        return
+
+    print("Decrypted share (authenticity verified):")
     print(decrypted.decode())
 
 

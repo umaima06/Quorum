@@ -142,6 +142,7 @@ class ShamirSecretSharing:
 
     def __init__(self, field=None):
         self.field = field or FiniteField()
+        self.last_polynomial = None
 
     def split(self, secret, n, k):
         """Split secret into n shares, any k of which can reconstruct it."""
@@ -458,7 +459,7 @@ def load_state():
             "days": None,
             "demo_speed": False,
             "last_checkin": None,
-            "trustees": [],   # [{ "name", "email", "encrypted_share_hex", "label" }]
+            "trustees": [],   # [{ "name", "email", "encrypted_share_hex", "label", "credential_hash" }]
             "secrets": [],    # [{ "label", "n", "k", "canaries", "secret_length_bytes", "timestamp" }]
             "triggered": False,
             "reminder_sent": False,
@@ -676,9 +677,9 @@ def load_env_file():
     (if it exists) and sets them as environment variables.
 
     quorum.env must NEVER be committed — it holds real email credentials
-    and (as of this patch) the dashboard's owner/trustee passphrases. It
-    is data, not source code, so it doesn't count against the single-file
-    rule; it must still be listed in .gitignore.
+    and the dashboard's owner passphrase. It is data, not source code, so
+    it doesn't count against the single-file rule; it must still be
+    listed in .gitignore.
     """
     if not ENV_FILE_PATH.exists():
         return
@@ -1059,35 +1060,34 @@ def cli_visualize(args):
 
 
 # =============================================================================
-# Dashboard authentication — passphrase-gated owner/trustee sessions (Bug 5)
+# Dashboard authentication — passphrase/credential-gated sessions (Bug 5)
 # =============================================================================
 #
 # A client-side Owner/Trustee toggle alone doesn't stop someone from calling
 # /api/split or /api/arm directly (e.g. with curl), bypassing the UI. This
-# adds a real server-side gate: a role passphrase — set in quorum.env, the
-# same place SMTP creds already live — is verified with the same hardened
-# KDF used for share encryption (PBKDF2-HMAC-SHA256), and a random session
-# token is issued as an HttpOnly cookie. Every state-changing API endpoint
-# checks the session's role against ROLE_MAP before running, so a curl call
-# with no valid session now gets a 401 — not a page that just hides a button.
-#
-# This is deliberately simple (in-memory sessions, single process) — that's
-# honestly documented in THREAT_MODEL.md rather than overclaimed. It is not
-# meant to replace the real design (owner and each trustee running this
-# dashboard on their own separate machine); it fixes the specific hole of
-# "the UI toggle is the only thing stopping a Trustee session from acting
-# as Owner."
+# adds a real server-side gate:
+#   - Owner signs in with a single passphrase from quorum.env, verified with
+#     the same hardened KDF used for share encryption (PBKDF2-HMAC-SHA256).
+#   - Each Trustee gets their OWN unique, randomly generated login credential
+#     when added (see cli/dashboard add-trustee), emailed to them and never
+#     shown in the browser again. Only its PBKDF2 hash is stored, alongside
+#     that trustee's record, so a credential match also tells us WHICH
+#     trustee logged in and which secret's share they're responsible for.
+# Either way, a random session token is issued as an HttpOnly cookie, and
+# every state-changing API endpoint checks the session's role against
+# ROLE_MAP before running — so a curl call with no valid session now gets a
+# 401, not a page that just hides a button.
 
 AUTH_SALT_PATH = Path("quorum_auth_salt.bin")
 SESSION_TTL_SECONDS = 60 * 60 * 4  # 4 hours — plenty for a demo, short enough to be honest
 
-_sessions = {}       # token -> {"role": "owner"|"trustee", "expires": float}
+_sessions = {}       # token -> {"role", "expires", [+trustee_name/email/label]}
 ROLE_HASHES = None   # populated at startup by _load_or_generate_passphrases()
 
 
 def _get_or_create_auth_salt():
-    """Persisted alongside quorum_state.json so passphrase hashes stay
-    stable across restarts."""
+    """Persisted alongside quorum_state.json so passphrase/credential
+    hashes stay stable across restarts."""
     if AUTH_SALT_PATH.exists():
         return AUTH_SALT_PATH.read_bytes()
     salt = secrets.token_bytes(16)
@@ -1097,80 +1097,61 @@ def _get_or_create_auth_salt():
 
 def _load_or_generate_passphrases():
     """
-    Reads QUORUM_OWNER_PASSPHRASE / QUORUM_TRUSTEE_PASSPHRASE from
-    quorum.env (already loaded into os.environ by load_env_file()). If
-    either is missing, generates one for this run and prints it once, so
-    a demo never hard-fails on missing config — the same fallback pattern
-    already used for SMTP credentials.
+    Reads QUORUM_OWNER_PASSPHRASE from quorum.env (already loaded into
+    os.environ by load_env_file()). If missing, generates one for this run
+    and prints it once, so a demo never hard-fails on missing config — the
+    same fallback pattern already used for SMTP credentials. Trustees don't
+    use a shared passphrase — each gets their own credential at add-trustee
+    time (see _handle_add_trustee).
     """
     owner_pass = os.environ.get("QUORUM_OWNER_PASSPHRASE")
-    trustee_pass = os.environ.get("QUORUM_TRUSTEE_PASSPHRASE")
     generated = []
 
     if not owner_pass:
         owner_pass = secrets.token_urlsafe(9)
         generated.append(("QUORUM_OWNER_PASSPHRASE", owner_pass))
-    if not trustee_pass:
-        trustee_pass = secrets.token_urlsafe(9)
-        generated.append(("QUORUM_TRUSTEE_PASSPHRASE", trustee_pass))
 
     if generated:
-        print("\n[Quorum] No dashboard passphrase(s) found in quorum.env — generated for this session:")
+        print("\n[Quorum] No owner passphrase found in quorum.env — generated for this session:")
         for key, val in generated:
             print(f"    {key}={val}")
-        print("[Quorum] Add these to quorum.env to keep them stable across restarts.\n")
+        print("[Quorum] Add this to quorum.env to keep it stable across restarts.\n")
 
     salt = _get_or_create_auth_salt()
     return {
         "owner": hashlib.pbkdf2_hmac("sha256", owner_pass.encode(), salt, 100_000),
-        "trustee": hashlib.pbkdf2_hmac("sha256", trustee_pass.encode(), salt, 100_000),
     }
 
 
 def _verify_passphrase(role, passphrase):
+    """
+    Owner: checked against the single passphrase hash loaded at startup.
+    Trustee: checked against every registered trustee's individual
+    credential_hash, so a match also identifies WHICH trustee signed in.
+    Returns an identity dict on success, or None on failure.
+    """
     if role == "owner":
         if not ROLE_HASHES or "owner" not in ROLE_HASHES:
             return None
-
         salt = _get_or_create_auth_salt()
-
-        candidate = hashlib.pbkdf2_hmac(
-            "sha256",
-            passphrase.encode(),
-            salt,
-            100_000
-        )
-
+        candidate = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), salt, 100_000)
         if hmac.compare_digest(candidate, ROLE_HASHES["owner"]):
             return {"role": "owner"}
-
         return None
 
     if role == "trustee":
         state = load_state()
         salt = _get_or_create_auth_salt()
-
-        candidate = hashlib.pbkdf2_hmac(
-            "sha256",
-            passphrase.encode(),
-            salt,
-            100_000
-        ).hex()
-
+        candidate = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), salt, 100_000).hex()
         for trustee in state.get("trustees", []):
             stored_hash = trustee.get("credential_hash")
-
-            if stored_hash and hmac.compare_digest(
-                candidate,
-                stored_hash
-            ):
+            if stored_hash and hmac.compare_digest(candidate, stored_hash):
                 return {
                     "role": "trustee",
                     "trustee_name": trustee["name"],
                     "trustee_email": trustee["email"],
-                    "label": trustee.get("label", "Unlabeled secret")
+                    "label": trustee.get("label", "Unlabeled secret"),
                 }
-
         return None
 
     return None
@@ -1203,6 +1184,8 @@ def _session_role(cookie_header):
 # Which role(s) each state-changing endpoint requires. Read-only GET
 # endpoints (status/log/list-secrets/trustees) are left open so the
 # dashboard's live countdown and audit-log view work even pre-login.
+# /api/login, /api/visualize-demo, and /api/visualize-demo/reconstruct
+# aren't listed here, so they always pass through (see _require_role).
 ROLE_MAP = {
     "/api/split": {"owner"},
     "/api/add-trustee": {"owner"},
@@ -1222,9 +1205,6 @@ def _require_role(handler, path):
     """
     Returns True if the request may proceed. Otherwise writes a 401 JSON
     response (via the handler's own _send_json) and returns False.
-    /api/login and /api/visualize-demo aren't in ROLE_MAP, so they always
-    pass through — login obviously can't require a session, and the demo
-    visualizer touches no real secrets or state.
     """
     required = ROLE_MAP.get(path)
     if required is None:
@@ -1234,6 +1214,23 @@ def _require_role(handler, path):
         handler._send_json({"error": "unauthorized", "required_role": sorted(required)}, status=401)
         return False
     return True
+
+
+# =============================================================================
+# Polynomial Demo data (Bug 4)
+# =============================================================================
+#
+# The Polynomial Demo tab visualizes the REAL output of the most recent
+# ShamirSecretSharing.split() call — not a separate hardcoded toy example.
+# The secret, the polynomial coefficients, and the exact 521-bit share
+# values never leave server memory (they are never written to
+# quorum_state.json and never sent to the browser). What the browser gets
+# is a lossy, normalized (0..1) view of each share's y-value — enough to
+# plot, not enough to reconstruct anything. Reconstruction itself happens
+# entirely server-side via ShamirSecretSharing.reconstruct(), never via
+# JavaScript floating-point Lagrange interpolation.
+
+POLY_DEMO_DATA = None  # {"label","n","k","prime","shares" (real ints),"secret_int","secret_length"}
 
 
 # =============================================================================
@@ -1315,9 +1312,10 @@ VISUALIZER_HTML = """
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #222; }
   th { color: #888; font-weight: 500; }
 
-  canvas { background: #1a1a1a; border: 1px solid #333; display: block; margin: 20px auto; }
+  canvas { background: #1a1a1a; border: 1px solid #333; display: block; margin: 20px auto; cursor: pointer; }
   #info { margin-top: 15px; font-size: 15px; color: #9fd; text-align: center; }
   .viz-btn-row { text-align: center; margin-top: 10px; }
+  .viz-caption { text-align: center; color: #666; font-size: 12px; margin: 4px auto; max-width: 620px; }
 </style>
 </head>
 <body>
@@ -1337,7 +1335,7 @@ VISUALIZER_HTML = """
       <option value="owner">Owner</option>
       <option value="trustee">Trustee</option>
     </select>
-    <label>Passphrase</label>
+    <label>Passphrase / credential</label>
     <input type="password" id="loginPass">
     <button class="action" onclick="doLogin()">Sign in</button>
     <div id="loginResult" class="result" style="display:none;"></div>
@@ -1491,14 +1489,26 @@ VISUALIZER_HTML = """
 
     <!-- POLY -->
     <div id="polyPanel" class="panel">
-      <p style="text-align:center; color:#9fd;">Watch the curve form as shares (points) combine. f(0) is the secret.</p>
-      <p style="text-align:center; color:#666; font-size:12px;">These points come from a real ShamirSecretSharing.split() call on a small demo field (p=97) — same code as production, not hardcoded.</p>
+      <p style="text-align:center; color:#9fd;">
+        This visualizes the <strong>real</strong> shares from the most recent
+        <code>ShamirSecretSharing.split()</code> call — not a separate hardcoded example.
+      </p>
+      <p class="viz-caption">
+        Values shown are normalized (scaled to 0–1) for display only, since the
+        real field is GF(2^521−1) — far too large to plot exactly, and this
+        scaling never reveals the exact share value or the secret. Click points
+        below to select shares, then reconstruct using Quorum's actual
+        <code>reconstruct()</code> function server-side — not JavaScript
+        floating-point math.
+      </p>
       <canvas id="c" width="700" height="450"></canvas>
       <div id="info">Loading real share data...</div>
       <div class="viz-btn-row">
-        <button class="action" onclick="addNextPoint()">Add Share</button>
-        <button class="action" onclick="resetPoly()">Reset</button>
+        <button class="action" onclick="reconstructSelected()">Reconstruct from selected shares</button>
+        <button class="action" onclick="clearSelection()">Clear selection</button>
+        <button class="action" onclick="loadPolyDemo()">Refresh (load latest split)</button>
       </div>
+      <div id="polyResult" class="result" style="display:none;"></div>
     </div>
   </div>
 
@@ -1530,7 +1540,7 @@ VISUALIZER_HTML = """
       }
 
       applyRoleVisibility(currentRole);
-      refreshStatus(); 
+      refreshStatus();
     } catch (e) {
       showResult('loginResult', e.message, true);
     }
@@ -1561,7 +1571,7 @@ VISUALIZER_HTML = """
     if (name === 'secrets') loadSecrets();
     if (name === 'chain') loadChain();
     if (name === 'trustees') loadTrustees();
-    if (name === 'poly' && !polyLoaded) loadPolyDemo();
+    if (name === 'poly') loadPolyDemo();
   }
 
   async function api(path, body) {
@@ -1689,6 +1699,7 @@ VISUALIZER_HTML = """
         text += '\\n\\nDecoy (canary) shares — do NOT use to reconstruct:\\n' + r.canary_shares.join('\\n');
       }
       showResult('splitResult', text, false);
+      polyLoaded = false; // this split is now the "latest" one for the Polynomial Demo tab
     } catch (e) { showResult('splitResult', e.message, true); }
   }
 
@@ -1715,7 +1726,7 @@ VISUALIZER_HTML = """
         encrypted_hex: document.getElementById('tHex').value,
       };
       await api('/api/add-trustee', body);
-      showResult('trusteeResult', `Added trustee: ${body.name} <${body.email}>`, false);
+      showResult('trusteeResult', `Added trustee: ${body.name} <${body.email}> — their login credential was emailed to them.`, false);
       loadTrustees();
     } catch (e) { showResult('trusteeResult', e.message, true); }
   }
@@ -1818,10 +1829,14 @@ VISUALIZER_HTML = """
     }
   }
 
-  // ---------- Polynomial demo (Bug 4: now backed by real SSS output) ----------
-  let P = 97, SECRET = 42;
-  let allPoints = [];
-  let revealed = [];
+  // ---------- Polynomial demo (Bug 4: real SSS shares, normalized for display) ----------
+  // No hardcoded secret, no hardcoded field. Everything here reflects the
+  // most recent real ShamirSecretSharing.split() call, fetched fresh from
+  // the server. The server sends only a lossy 0..1 normalization of each
+  // share's y-value — plenty to plot, nowhere near enough to reconstruct.
+  let polyLabel = '', polyN = 0, polyK = 0;
+  let polyPoints = [];        // [{index, x, y_normalized}]
+  let polySelected = new Set();
   let polyLoaded = false;
 
   const canvas = document.getElementById('c');
@@ -1830,66 +1845,84 @@ VISUALIZER_HTML = """
 
   async function loadPolyDemo() {
     try {
-      const r = await api('/api/visualize-demo', { secret: SECRET, n: 5, k: 3 });
-      P = r.prime;
-      allPoints = r.shares;
-      revealed = [];
+      const r = await api('/api/visualize-demo', {});
+      polyLabel = r.label; polyN = r.n; polyK = r.k;
+      polyPoints = r.points;
+      polySelected = new Set();
       polyLoaded = true;
-      render();
+      document.getElementById('polyResult').style.display = 'none';
+      renderPoly();
     } catch (e) {
-      document.getElementById('info').textContent = 'Could not load real demo data: ' + e.message;
+      polyLoaded = false;
+      ctx.clearRect(0, 0, W, H);
+      document.getElementById('info').textContent = e.message;
     }
   }
 
-  function toScreen(x, y) {
-    return [padding + (x/6)*(W-2*padding), H-padding-(y/P)*(H-2*padding)];
+  function toScreen(index, yNorm) {
+    const x = padding + ((index + 1) / (polyN + 1)) * (W - 2 * padding);
+    const y = H - padding - yNorm * (H - 2 * padding);
+    return [x, y];
   }
-  function drawAxes() {
+
+  function renderPoly() {
+    ctx.clearRect(0, 0, W, H);
     ctx.strokeStyle = "#444"; ctx.beginPath();
-    ctx.moveTo(padding, H-padding); ctx.lineTo(W-padding, H-padding);
-    ctx.moveTo(padding, padding); ctx.lineTo(padding, H-padding); ctx.stroke();
-  }
-  function drawPoints() {
-    ctx.fillStyle = "#5cf";
-    for (const [x,y] of revealed) { const [sx,sy]=toScreen(x,y); ctx.beginPath(); ctx.arc(sx,sy,6,0,2*Math.PI); ctx.fill(); }
-  }
-  function lagrangeAt(x0, points) {
-    let result = 0;
-    for (let i=0;i<points.length;i++){
-      let [xi,yi]=points[i]; let num=1,den=1;
-      for (let j=0;j<points.length;j++){ if(i===j)continue; let [xj,_]=points[j]; num*=(x0-xj); den*=(xi-xj); }
-      result += yi*(num/den);
+    ctx.moveTo(padding, H - padding); ctx.lineTo(W - padding, H - padding);
+    ctx.moveTo(padding, padding); ctx.lineTo(padding, H - padding); ctx.stroke();
+
+    polyPoints.forEach(p => {
+      const [sx, sy] = toScreen(p.index, p.y_normalized);
+      ctx.fillStyle = polySelected.has(p.index) ? "#fc5" : "#5cf";
+      ctx.beginPath(); ctx.arc(sx, sy, 8, 0, 2 * Math.PI); ctx.fill();
+      ctx.fillStyle = "#888"; ctx.font = "11px monospace";
+      ctx.fillText('x=' + p.x, sx - 14, sy + 22);
+    });
+
+    const info = document.getElementById('info');
+    if (polyLoaded) {
+      info.textContent = `"${polyLabel}" — ${polySelected.size} of ${polyN} shares selected `
+        + `(need ${polyK} to reconstruct). Click a point to select/deselect.`;
     }
-    return result;
   }
-  function drawCurve() {
-    if (revealed.length < 3) return;
-    ctx.strokeStyle="#9f5"; ctx.lineWidth=2; ctx.beginPath();
-    let first=true;
-    for (let x=0;x<=6;x+=0.1){
-      const y=lagrangeAt(x,revealed);
-      if (y<0||y>P){first=true;continue;}
-      const [sx,sy]=toScreen(x,y);
-      if(first){ctx.moveTo(sx,sy);first=false;} else ctx.lineTo(sx,sy);
+
+  canvas.addEventListener('click', (ev) => {
+    if (!polyLoaded) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+    for (const p of polyPoints) {
+      const [sx, sy] = toScreen(p.index, p.y_normalized);
+      if (Math.hypot(mx - sx, my - sy) < 12) {
+        if (polySelected.has(p.index)) polySelected.delete(p.index);
+        else polySelected.add(p.index);
+        renderPoly();
+        return;
+      }
     }
-    ctx.stroke();
-    const [sx0,sy0]=toScreen(0,lagrangeAt(0,revealed));
-    ctx.fillStyle="#fc5"; ctx.beginPath(); ctx.arc(sx0,sy0,7,0,2*Math.PI); ctx.fill();
+  });
+
+  function clearSelection() {
+    polySelected = new Set();
+    renderPoly();
+    document.getElementById('polyResult').style.display = 'none';
   }
-  function render() {
-    ctx.clearRect(0,0,W,H); drawAxes(); drawPoints(); drawCurve();
-    const info=document.getElementById('info');
-    if (!polyLoaded) { info.textContent = 'Loading real share data...'; return; }
-    if (revealed.length<3) info.textContent = `Shares revealed: ${revealed.length} / 3 needed. (real SSS output, p=${P})`;
-    else info.textContent = `Curve reconstructed! f(0) = ${Math.round(lagrangeAt(0,revealed))} (the secret)`;
+
+  async function reconstructSelected() {
+    try {
+      const indices = Array.from(polySelected);
+      // Real reconstruction happens server-side via Quorum's actual
+      // ShamirSecretSharing.reconstruct() — never JS floating-point math.
+      const r = await api('/api/visualize-demo/reconstruct', { indices });
+      showResult('polyResult', r.message, !r.success);
+    } catch (e) {
+      showResult('polyResult', e.message, true);
+    }
   }
-  function addNextPoint() { if(polyLoaded && revealed.length<allPoints.length){revealed.push(allPoints[revealed.length]); render();} }
-  function resetPoly() { revealed=[]; render(); }
 </script>
 </body>
 </html>
 """
-POLY_DEMO_DATA = None
+
 
 class VisualizerHandler(http.server.BaseHTTPRequestHandler):
     """Serves the dashboard HTML and a JSON API that drives the same
@@ -1923,8 +1956,9 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Bug 5: server-side role gate, checked before any state-changing
-        # endpoint runs. /api/login and /api/visualize-demo aren't in
-        # ROLE_MAP so they always pass through.
+        # endpoint runs. /api/login, /api/visualize-demo, and
+        # /api/visualize-demo/reconstruct aren't in ROLE_MAP so they
+        # always pass through.
         if not _require_role(self, self.path):
             return
 
@@ -1955,15 +1989,18 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
                 self._handle_login(data)
             elif self.path == "/api/visualize-demo":
                 self._handle_visualize_demo(data)
+            elif self.path == "/api/visualize-demo/reconstruct":
+                self._handle_visualize_demo_reconstruct(data)
             else:
                 self._send_json({"error": "unknown endpoint"}, status=404)
         except Exception as e:
             self._send_json({"error": str(e)}, status=400)
 
     # ---------- handlers (each mirrors the matching cli_* function) ----------
-    global POLY_DEMO_DATA
 
     def _handle_split(self, data):
+        global POLY_DEMO_DATA
+
         field = FiniteField()
         sss = ShamirSecretSharing(field)
         trap = CanaryTrap(field)
@@ -1981,18 +2018,21 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         shares = sss.split(secret_int, n=n, k=k)
-        poly = sss.last_polynomial
+        canary_shares = trap.generate_canaries(canaries)
+
+        # Bug 4: this split becomes the "latest" one the Polynomial Demo
+        # tab visualizes. Kept in server memory ONLY — never written to
+        # quorum_state.json, and the secret/exact shares are never sent
+        # to the browser (see _handle_visualize_demo).
         POLY_DEMO_DATA = {
             "label": label,
             "n": n,
             "k": k,
             "prime": field.p,
-            "shares": shares,
-            "secret_int": secret_int,
+            "shares": shares,          # real (x, y) ints
+            "secret_int": secret_int,  # kept server-side only, never sent
             "secret_length": len(secret_bytes),
         }
-  
-        canary_shares = trap.generate_canaries(canaries)
 
         audit_log("split", {"label": label, "n": n, "k": k, "canaries": canaries,
                              "secret_length_bytes": len(secret_bytes)})
@@ -2019,16 +2059,13 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
         encrypted_hex = str(data["encrypted_hex"])
         label = str(data["label"])
 
-        # Generate a unique login credential for this trustee
+        # Generate a unique login credential for this trustee.
         credential = secrets.token_urlsafe(12)
 
-        # Store only the hash, never the actual credential
+        # Store only the PBKDF2 hash — never the actual credential.
         salt = _get_or_create_auth_salt()
         credential_hash = hashlib.pbkdf2_hmac(
-            "sha256",
-            credential.encode(),
-            salt,
-            100_000
+            "sha256", credential.encode(), salt, 100_000
         ).hex()
 
         entry = {
@@ -2042,23 +2079,15 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
         state["trustees"].append(entry)
         save_state(state)
 
-        # Send the credential to the trustee
+        # Send the credential to the trustee out of band — never returned
+        # to the browser that made this request.
         notify_trustee_credential(name, email, credential)
 
-        audit_log("add_trustee", {
-            "name": name,
-            "email": email,
-            "label": label
-        })
+        audit_log("add_trustee", {"name": name, "email": email, "label": label})
 
-        # Do NOT send credential back to browser
         self._send_json({
             "ok": True,
-            "trustee": {
-                "name": name,
-                "email": email,
-                "label": label
-            }
+            "trustee": {"name": name, "email": email, "label": label},
         })
 
     def _handle_arm(self, data):
@@ -2204,34 +2233,25 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
 
         if role not in ("owner", "trustee"):
             audit_log("login_failed", {"role": role})
-            self._send_json(
-                {"error": "invalid role or passphrase"},
-                status=401
-            )
+            self._send_json({"error": "invalid role or passphrase"}, status=401)
             return
 
         identity = _verify_passphrase(role, passphrase)
 
         if not identity:
             audit_log("login_failed", {"role": role})
-            self._send_json(
-                {"error": "invalid role or passphrase"},
-                status=401
-            )
+            self._send_json({"error": "invalid role or passphrase"}, status=401)
             return
 
         token = _create_session(role)
 
-        # Keep track of which trustee actually logged in
+        # Keep track of which trustee actually logged in.
         if role == "trustee":
             _sessions[token]["trustee_name"] = identity["trustee_name"]
             _sessions[token]["trustee_email"] = identity["trustee_email"]
             _sessions[token]["label"] = identity["label"]
 
-        audit_log("login", {
-            "role": role,
-            "trustee": identity.get("trustee_name")
-        })
+        audit_log("login", {"role": role, "trustee": identity.get("trustee_name")})
 
         cookie = SimpleCookie()
         cookie["quorum_session"] = token
@@ -2243,47 +2263,101 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
             "ok": True,
             "role": role,
             "trustee_name": identity.get("trustee_name"),
-            "label": identity.get("label")
+            "label": identity.get("label"),
         }).encode()
 
         self.send_response(200)
-        self.send_header(
-            "Content-type",
-            "application/json; charset=utf-8"
-        )
-        self.send_header(
-            "Set-Cookie",
-            cookie["quorum_session"].OutputString()
-        )
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", cookie["quorum_session"].OutputString())
         self.end_headers()
         self.wfile.write(body)
 
     def _handle_visualize_demo(self, data):
+        """
+        Bug 4: returns a lossy, normalized (0..1) view of the REAL shares
+        from the most recent split — never the exact 521-bit values, never
+        the secret, never the polynomial coefficients. Enough to plot,
+        nowhere near enough to reconstruct anything from this response
+        alone (reconstruction only happens via
+        _handle_visualize_demo_reconstruct, using the real stored shares
+        server-side).
+        """
         global POLY_DEMO_DATA
 
         if POLY_DEMO_DATA is None:
             self._send_json(
-                {"error": "No secret has been split yet. Split a secret first."},
-                status=400
+                {"error": "No secret has been split yet — split one in the Secrets tab first."},
+                status=400,
             )
             return
 
         demo = POLY_DEMO_DATA
+        prime = demo["prime"]
+        points = []
+        for i, (x, y) in enumerate(demo["shares"]):
+            # Lossy, display-only normalization: y/prime as a float in
+            # [0, 1). This never reveals the exact share value.
+            y_normalized = y / prime
+            points.append({"index": i, "x": x, "y_normalized": y_normalized})
 
         self._send_json({
             "label": demo["label"],
             "n": demo["n"],
             "k": demo["k"],
-            "prime": str(demo["prime"]),
-            "shares": [
-                [str(x), str(y)]
-                for x, y in demo["shares"]
-            ],
-            "secret_length": demo["secret_length"],
+            "points": points,
             "note": (
-                "These are the actual shares generated by Quorum's "
-                "ShamirSecretSharing implementation during the latest split."
-            )
+                "Normalized (lossy) view of the real shares from Quorum's actual "
+                "ShamirSecretSharing.split() over GF(2^521-1) — scaled only so a "
+                "human can see them, not the exact share values, and not usable "
+                "on its own to reconstruct anything."
+            ),
+        })
+
+    def _handle_visualize_demo_reconstruct(self, data):
+        """
+        Bug 4: reconstructs using Quorum's REAL ShamirSecretSharing.reconstruct()
+        over the actual shares from the latest split, selected by index from
+        what /api/visualize-demo listed. Never uses JavaScript floating-point
+        Lagrange interpolation, and never returns the secret itself — only
+        whether reconstruction succeeded, matching the "3 of 5 shares →
+        reconstruction successful" framing without exposing anything.
+        """
+        global POLY_DEMO_DATA
+
+        if POLY_DEMO_DATA is None:
+            self._send_json({"error": "No secret has been split yet."}, status=400)
+            return
+
+        demo = POLY_DEMO_DATA
+        indices = data.get("indices", [])
+        if not isinstance(indices, list) or not indices:
+            self._send_json({"error": "select at least one share first"}, status=400)
+            return
+
+        try:
+            selected = [demo["shares"][int(i)] for i in indices]
+        except (IndexError, ValueError, TypeError):
+            self._send_json({"error": "invalid share index"}, status=400)
+            return
+
+        field = FiniteField(prime=demo["prime"])
+        sss = ShamirSecretSharing(field)
+        recovered = sss.reconstruct(selected)
+        success = recovered == demo["secret_int"]
+
+        audit_log("visualize_demo_reconstruct", {
+            "label": demo["label"],
+            "shares_used": len(selected),
+            "success": success,
+        })
+
+        outcome = "successful \u2705" if success else "failed (not enough shares yet)"
+        self._send_json({
+            "shares_used": len(selected),
+            "n": demo["n"],
+            "k": demo["k"],
+            "success": success,
+            "message": f"{len(selected)} of {demo['n']} shares \u2192 reconstruction {outcome}",
         })
 
     # ---------- response helpers ----------

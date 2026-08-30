@@ -453,11 +453,17 @@ def load_state():
             "days": None,
             "demo_speed": False,
             "last_checkin": None,
-            "trustees": [],   # [{ "name": ..., "email": ..., "encrypted_share_hex": ... }]
+            "trustees": [],   # [{ "name", "email", "encrypted_share_hex", "label" }]
+            "secrets": [],    # [{ "label", "n", "k", "canaries", "secret_length_bytes", "timestamp" }]
             "triggered": False,
+            "reminder_sent": False,
         }
     with open(CONFIG_PATH, "r") as f:
-        return json.load(f)
+        state = json.load(f)
+    # Backfill defaults for state files saved before these fields existed.
+    state.setdefault("secrets", [])
+    state.setdefault("reminder_sent", False)
+    return state
 
 
 def save_state(state):
@@ -496,6 +502,7 @@ def cli_arm(args):
     state["demo_speed"] = args.demo_speed
     state["last_checkin"] = time.time()
     state["triggered"] = False
+    state["reminder_sent"] = False
     save_state(state)
 
     audit_log("arm", {"days": args.days, "demo_speed": args.demo_speed})
@@ -519,6 +526,7 @@ def cli_checkin(args):
         return
 
     state["last_checkin"] = time.time()
+    state["reminder_sent"] = False
     save_state(state)
     audit_log("checkin", {})
     print(f"Checked in at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}. Timer reset.")
@@ -547,10 +555,60 @@ def cli_status(args):
         print(f"Trustees on file: {len(state['trustees'])}")
 
 
+def send_owner_reminder(state):
+    """
+    Notify the OWNER (not a trustee) that their check-in window is running
+    low — this is the automation added instead of auto-checkin: it helps
+    the owner remember to act, without ever letting anything but the
+    owner's own deliberate `checkin` count as proof of life.
+
+    Sent to the same address configured as the SMTP sender (QUORUM_SMTP_USER)
+    — i.e. the owner emails themselves — so no extra config is needed.
+    """
+    owner_email = os.environ.get("QUORUM_SMTP_USER")
+    unit = "seconds" if state["demo_speed"] else "days"
+    elapsed = time.time() - state["last_checkin"]
+    total = window_seconds(state["days"], state["demo_speed"])
+    remaining = total - elapsed
+    remaining_display = remaining if state["demo_speed"] else remaining / (24 * 3600)
+
+    subject = "Quorum: your check-in window is running low"
+    body = (
+        f"Reminder: your Quorum switch has about {remaining_display:.1f} {unit} left "
+        f"before it triggers and notifies your trustees.\n\n"
+        f"If you're okay, run: python quorum.py checkin\n\n"
+        f"— Quorum"
+    )
+
+    host = os.environ.get("QUORUM_SMTP_HOST")
+    port = os.environ.get("QUORUM_SMTP_PORT")
+    user = os.environ.get("QUORUM_SMTP_USER")
+    password = os.environ.get("QUORUM_SMTP_PASS")
+
+    if host and port and user and password and owner_email:
+        try:
+            _send_email(host, int(port), user, password, owner_email, subject, body)
+            audit_log("owner_reminder_sent", {"method": "smtp"})
+            print(f"  📧 Reminder emailed to owner <{owner_email}>")
+            return
+        except Exception as e:
+            print(f"  ⚠️  Owner reminder email failed ({e}) — falling back to local log.")
+
+    with open(MAILBOX_LOG_PATH, "a") as f:
+        f.write(f"\n{'='*60}\nTO: (owner)\nSUBJECT: {subject}\n{'-'*60}\n{body}\n")
+    audit_log("owner_reminder_sent", {"method": "local_log"})
+    print(f"  📝 Reminder logged to {MAILBOX_LOG_PATH}")
+
+
+REMINDER_THRESHOLD = 0.2  # send a reminder once remaining time drops below 20% of the window
+
+
 def cli_watch(args):
     """
     Run the check-in daemon in the foreground: polls every second, fires
     the switch (and sends notifications) the moment the window expires.
+    Also sends the owner ONE reminder email when their window drops below
+    20% remaining, so they don't forget to check in.
 
     In a demo, this is the command left running in a visible terminal so
     judges watch the countdown hit zero and notifications fire live.
@@ -571,6 +629,13 @@ def cli_watch(args):
                 print("\n⏰ Check-in window expired. Triggering switch...")
                 trigger_switch(state)
                 return
+
+            if not state["reminder_sent"] and total > 0 and (remaining / total) < REMINDER_THRESHOLD:
+                print(f"\n⚠️  Window below {int(REMINDER_THRESHOLD*100)}% remaining — reminding owner...")
+                send_owner_reminder(state)
+                state["reminder_sent"] = True
+                save_state(state)
+
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopped watching (switch state unchanged).")
@@ -638,6 +703,7 @@ def notify_trustee(trustee):
         f"Hi {trustee['name']},\n\n"
         f"The owner has not checked in within the configured window. "
         f"The dead-man's-switch has fired.\n\n"
+        f"This share is for: \"{trustee.get('label', 'unlabeled secret')}\"\n\n"
         f"Your encrypted share (decrypt using your Diffie-Hellman shared key):\n"
         f"{trustee.get('encrypted_share_hex', '<no share on file>')}\n\n"
         f"Run: python quorum.py decrypt-share --my-private <your_private> "
@@ -689,21 +755,40 @@ def _log_to_mailbox(trustee, subject, body):
 
 
 def cli_add_trustee(args):
-    """Register a trustee: name, email, and their pre-encrypted share."""
+    """Register a trustee: name, email, their pre-encrypted share, and which
+    labeled secret that share is for — so a trustee holding shares for
+    multiple secrets never mixes them up."""
     state = load_state()
     state["trustees"].append({
         "name": args.name,
         "email": args.email,
         "encrypted_share_hex": args.encrypted_hex,
+        "label": args.label,
     })
     save_state(state)
-    audit_log("add_trustee", {"name": args.name, "email": args.email})
-    print(f"Added trustee: {args.name} <{args.email}>")
+    audit_log("add_trustee", {"name": args.name, "email": args.email, "label": args.label})
+    print(f"Added trustee: {args.name} <{args.email}> — share for: \"{args.label}\"")
 
 
 # =============================================================================
 # Reproducible build tooling
 # =============================================================================
+
+def cli_list_secrets(args):
+    """List every labeled secret that has been split so far, with its trustees."""
+    state = load_state()
+    if not state["secrets"]:
+        print("No secrets split yet.")
+        return
+    for s in state["secrets"]:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s["timestamp"]))
+        print(f"\"{s['label']}\" — {s['n']} shares, threshold {s['k']}, split at {ts}")
+        matching_trustees = [t["name"] for t in state["trustees"] if t.get("label") == s["label"]]
+        if matching_trustees:
+            print(f"   Trustees: {', '.join(matching_trustees)}")
+        else:
+            print("   Trustees: none registered yet")
+
 
 def cli_build_check(args):
     """
@@ -772,11 +857,25 @@ def cli_split(args):
     shares = sss.split(secret_int, n=args.n, k=args.k)
     canaries = trap.generate_canaries(args.canaries)
 
-    audit_log("split", {"n": args.n, "k": args.k, "canaries": args.canaries,
+    audit_log("split", {"label": args.label, "n": args.n, "k": args.k, "canaries": args.canaries,
                          "secret_length_bytes": len(secret_bytes)})
 
-    print(f"Secret split into {args.n} shares, threshold {args.k}.")
-    print(f"(length={len(secret_bytes)} bytes — you'll need this to reconstruct)\n")
+    # Record what this secret IS, so it's never confused with another one
+    # split later (e.g. "Gmail password" vs "wallet seed phrase").
+    state = load_state()
+    state["secrets"].append({
+        "label": args.label,
+        "n": args.n,
+        "k": args.k,
+        "canaries": args.canaries,
+        "secret_length_bytes": len(secret_bytes),
+        "timestamp": time.time(),
+    })
+    save_state(state)
+
+    print(f"=== Secret label: \"{args.label}\" ===")
+    print(f"Split into {args.n} shares, threshold {args.k}.")
+    print(f"(length={len(secret_bytes)} bytes — you'll need this AND the label to reconstruct)\n")
 
     print("Real shares:")
     for share in shares:
@@ -1046,6 +1145,8 @@ def build_cli():
     # --- core crypto commands (Umaima's lane) ---
     split_parser = subparsers.add_parser("split", help="Split a secret into shares")
     split_parser.add_argument("secret", help="The secret to split (as plain text)")
+    split_parser.add_argument("--label", required=True,
+                               help="What this secret IS, e.g. 'Gmail password' or 'Wallet seed phrase' — prevents mixing up multiple protected secrets")
     split_parser.add_argument("--n", type=int, required=True, help="Total number of shares")
     split_parser.add_argument("--k", type=int, required=True, help="Threshold needed to reconstruct")
     split_parser.add_argument("--canaries", type=int, default=0, help="Number of decoy canary shares to generate")
@@ -1098,11 +1199,16 @@ def build_cli():
     trustee_parser.add_argument("--name", required=True)
     trustee_parser.add_argument("--email", required=True)
     trustee_parser.add_argument("--encrypted-hex", required=True, dest="encrypted_hex")
+    trustee_parser.add_argument("--label", required=True,
+                                 help="Which secret this share is for, matching the --label used in 'split'")
     trustee_parser.set_defaults(func=cli_add_trustee)
 
     buildcheck_parser = subparsers.add_parser("build-check", help="Hash a file for reproducible-build proof")
     buildcheck_parser.add_argument("--file", default="quorum.py")
     buildcheck_parser.set_defaults(func=cli_build_check)
+
+    listsecrets_parser = subparsers.add_parser("list-secrets", help="List every labeled secret and its trustees")
+    listsecrets_parser.set_defaults(func=cli_list_secrets)
 
     # --- Chain of Custody commands ---
     verifylog_parser = subparsers.add_parser("verify-log", help="Verify the tamper-evident audit log chain")

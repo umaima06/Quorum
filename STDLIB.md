@@ -15,6 +15,8 @@ and the standard-library feature we used instead.
 | A task-scheduling package (e.g. `schedule`, `APScheduler`) | `threading` + `time` | The check-in daemon (`watch`) and the `--demo-speed` timer compression are built on stdlib threading and time primitives. |
 | A JSON/config library beyond the basics | `json` + `pathlib` | State persistence (`quorum_state.json`) and the audit log read/write straight through stdlib `json` and `pathlib`, no serialization package. |
 | A blockchain/audit-log package (e.g. for tamper-evident logging) | Hand-rolled hash-chained log (`hashlib.sha256`) | Chain of Custody links every log entry to the SHA-256 hash of the previous one — the same structural idea behind Certificate Transparency logs, built from a single stdlib hash function. |
+| A background job runner / scheduler library (e.g. `APScheduler`, or a separate worker process) | `threading.Thread` (daemon) | The dashboard's "Start Watching" button spins up the check-in daemon as a background thread inside the same process — polling for switch timeout and sending reminder/trigger notifications — instead of requiring a separate process manager or scheduling package. |
+| A URL-opening/launcher utility | `webbrowser` | `quorum.py visualize` auto-opens the dashboard in the user's default browser after the local server starts, without shelling out to OS-specific commands. |
 
 ## Package Killer candidate
 

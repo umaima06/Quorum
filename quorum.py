@@ -45,6 +45,8 @@ from pathlib import Path
 # Large prime defining our finite field GF(p) for Shamir's Secret Sharing.
 # 2^521 - 1 is a well-known Mersenne prime, plenty large for realistic secrets.
 SSS_PRIME = 2**521 - 1
+_watch_thread = None
+_watch_thread_stop = threading.Event()
 
 # Standard 2048-bit MODP Diffie-Hellman group (RFC 3526, Group 14).
 # Publicly vetted parameters — not invented ourselves, per Track E's rules.
@@ -768,6 +770,20 @@ def cli_add_trustee(args):
     save_state(state)
     audit_log("add_trustee", {"name": args.name, "email": args.email, "label": args.label})
     print(f"Added trustee: {args.name} <{args.email}> — share for: \"{args.label}\"")
+    
+def cli_remove_trustee(args):
+    """Remove a trustee by name (and optionally label, if names collide)."""
+    state = load_state()
+    before = len(state["trustees"])
+    if args.label:
+        state["trustees"] = [t for t in state["trustees"]
+                              if not (t["name"] == args.name and t.get("label") == args.label)]
+    else:
+        state["trustees"] = [t for t in state["trustees"] if t["name"] != args.name]
+    removed = before - len(state["trustees"])
+    save_state(state)
+    audit_log("remove_trustee", {"name": args.name, "label": args.label, "removed_count": removed})
+    print(f"Removed {removed} trustee entry(ies) matching '{args.name}'.")
 
 
 # =============================================================================
@@ -990,125 +1006,552 @@ VISUALIZER_HTML = """
 <html>
 <head>
 <meta charset="UTF-8">
-<title>Quorum Visualizer</title>
+<title>Quorum Dashboard</title>
 <style>
-  body { font-family: sans-serif; background: #111; color: #eee; text-align: center; padding-top: 40px; }
-  canvas { background: #1a1a1a; border: 1px solid #333; margin-top: 20px; }
-  #info { margin-top: 15px; font-size: 15px; color: #9fd; }
+    * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, sans-serif; background: #0d0d0d; color: #eee;
+    margin: 0; padding: 30px 20px;
+  }
+  h1 { text-align: center; font-size: 26px; margin-bottom: 4px; }
+  .subtitle { text-align: center; color: #888; margin-bottom: 24px; font-size: 14px; }
+  .tabs { display: flex; justify-content: center; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
+  .tab-btn {
+    background: #1a1a1a; border: 1px solid #333; color: #ccc; padding: 8px 16px;
+    border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  .tab-btn.active { background: #2a3f2a; border-color: #4a7a4a; color: #9f5; }
+  .panel { display: none; max-width: 800px; margin: 0 auto; }
+  .panel.active { display: block; }
+
+  .card { background: #161616; border: 1px solid #2a2a2a; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+  .card h3 { margin-top: 0; color: #9fd; font-size: 15px; }
+  label { display: block; font-size: 12px; color: #999; margin-top: 10px; margin-bottom: 4px; }
+  input[type=text], input[type=number], textarea {
+    width: 100%; background: #0d0d0d; border: 1px solid #333; color: #eee;
+    padding: 8px 10px; border-radius: 5px; font-size: 13px; font-family: monospace;
+  }
+  input[type=checkbox] { margin-right: 6px; }
+  button.action {
+    background: #2a3f2a; border: 1px solid #4a7a4a; color: #9f5; padding: 8px 16px;
+    border-radius: 6px; cursor: pointer; font-size: 13px; margin-top: 12px; margin-right: 8px;
+  }
+  button.danger { background: #3f2a2a; border-color: #7a4a4a; color: #f66; }
+  .result { margin-top: 12px; padding: 10px; background: #0d0d0d; border: 1px solid #2a2a2a;
+    border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .result.error { border-color: #a33; color: #f66; }
+  .result.ok { border-color: #2a5f2a; color: #9f5; }
+  .share-line { padding: 4px 0; border-bottom: 1px solid #222; cursor: pointer; }
+  .share-line:hover { color: #9f5; }
+  .hint { font-size: 11px; color: #666; margin-top: 4px; }
+
+  /* status */
+  .status-big { text-align: center; padding: 20px; }
+  .countdown { font-size: 40px; font-weight: 700; color: #9f5; }
+  .countdown.expired { color: #f66; }
+  .bar-bg { background: #222; border-radius: 6px; height: 10px; margin: 14px 0; overflow: hidden; }
+  .bar-fill { background: #4a7a4a; height: 100%; transition: width 0.5s; }
+  .bar-fill.low { background: #a33; }
+
+  /* chain */
+  #chainStatus { text-align: center; padding: 14px; border-radius: 8px; margin-bottom: 20px; font-size: 15px; font-weight: 600; }
+  #chainStatus.ok { background: #1a2f1a; color: #9f5; border: 1px solid #2a5f2a; }
+  #chainStatus.broken { background: #2f1a1a; color: #f66; border: 1px solid #5f2a2a; }
+  .chain { display: flex; flex-direction: column; gap: 2px; }
+  .block { background: #161616; border: 1px solid #2a2a2a; border-radius: 6px; padding: 10px 14px; font-size: 13px; }
+  .block.broken { border-color: #a33; background: #2a1414; }
+  .block-link { text-align: center; color: #444; font-size: 16px; margin: -2px 0; }
+  .block-link.broken { color: #a33; }
+  .block-event { color: #9f5; font-weight: 600; }
+  .block-event.broken-event { color: #f66; }
+  .block-meta { color: #888; font-size: 11px; margin-top: 4px; }
+  .block-details { color: #aaa; font-size: 12px; margin-top: 4px; font-family: monospace; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 10px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #222; }
+  th { color: #888; font-weight: 500; }
+
+  canvas { background: #1a1a1a; border: 1px solid #333; display: block; margin: 20px auto; }
+  #info { margin-top: 15px; font-size: 15px; color: #9fd; text-align: center; }
+  .viz-btn-row { text-align: center; margin-top: 10px; }
 </style>
 </head>
 <body>
-  <h1>Quorum — Polynomial Reconstruction</h1>
-  <p>Watch the curve form as shares (points) combine. f(0) is the secret.</p>
-  <canvas id="c" width="700" height="450"></canvas>
-  <div id="info">Click "Add Share" to reveal points one at a time.</div>
-  <br>
-  <button onclick="addNextPoint()" style="padding:8px 16px; font-size:14px;">Add Share</button>
-  <button onclick="reset()" style="padding:8px 16px; font-size:14px;">Reset</button>
+  <h1>Quorum</h1>
+  <div class="subtitle">Dead-man's-switch secret sharing — live control panel</div>
 
+  <div class="tabs">
+    <button class="tab-btn active" onclick="showTab('switch')">Switch</button>
+    <button class="tab-btn" onclick="showTab('secrets')">Secrets</button>
+    <button class="tab-btn" onclick="showTab('trustees')">Trustees</button>
+    <button class="tab-btn" onclick="showTab('keys')">Keys &amp; Encryption</button>
+    <button class="tab-btn" onclick="showTab('chain')">Chain of Custody</button>
+    <button class="tab-btn" onclick="showTab('poly')">Polynomial Demo</button>
+  </div>
+
+  <!-- SWITCH -->
+  <div id="switchPanel" class="panel active">
+    <div class="card status-big">
+      <div id="switchStatusText">Loading...</div>
+      <div class="countdown" id="countdown">--</div>
+      <div class="bar-bg"><div class="bar-fill" id="bar" style="width:0%"></div></div>
+      <div class="hint" id="trusteeCount"></div>
+    </div>
+    <div class="card">
+      <h3>Background watcher</h3>
+      <div class="hint">Must be running for reminders/triggers to actually fire — the countdown above is just a display.</div>
+      <button class="action" onclick="startWatch()">▶ Start Watching</button>
+      <button class="action danger" onclick="stopWatch()">■ Stop Watching</button>
+      <div id="watchResult" class="result" style="display:none;"></div>
+    </div>
+    <div class="card">
+      <h3>Arm the switch</h3>
+      <label>Window (days, or seconds if demo speed)</label>
+      <input type="number" id="armDays" value="30">
+      <label><input type="checkbox" id="armDemoSpeed" checked> Demo speed (treat as seconds)</label>
+      <label><input type="checkbox" id="armForce"> Force re-arm if already armed</label>
+      <button class="action" onclick="doArm()">Arm Switch</button>
+      <button class="action" onclick="doCheckin()">Check In</button>
+      <div id="switchResult" class="result" style="display:none;"></div>
+    </div>
+  </div>
+
+  <!-- SECRETS -->
+  <div id="secretsPanel" class="panel">
+    <div class="card">
+      <h3>Split a new secret</h3>
+      <label>Secret</label>
+      <input type="text" id="splitSecret" placeholder="e.g. wallet-seed-xyz">
+      <label>Label (what this secret IS)</label>
+      <input type="text" id="splitLabel" placeholder="e.g. Crypto wallet seed">
+      <label>N (total shares)</label>
+      <input type="number" id="splitN" value="5">
+      <label>K (threshold to reconstruct)</label>
+      <input type="number" id="splitK" value="3">
+      <label>Canary (decoy) shares</label>
+      <input type="number" id="splitCanaries" value="1">
+      <button class="action" onclick="doSplit()">Split Secret</button>
+      <div id="splitResult" class="result" style="display:none;"></div>
+      <button class="action" id="splitResultCopyBtn" onclick="copyResult('splitResult')">📋 Copy</button>
+    </div>
+    <div class="card">
+      <h3>All secrets on file</h3>
+      <button class="action" onclick="loadSecrets()">Refresh</button>
+      <table id="secretsTable"><thead><tr><th>Label</th><th>N/K</th><th>Trustees</th></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h3>Reconstruct a secret (trustees do this)</h3>
+      <label>Shares (one per line, format x:y)</label>
+      <textarea id="reconShares" rows="4" placeholder="1:2322588...&#10;2:4645176..."></textarea>
+      <label>Secret length in bytes (shown when it was split)</label>
+      <input type="number" id="reconLength">
+      <button class="action" onclick="doReconstruct()">Reconstruct</button>
+      <div id="reconResult" class="result" style="display:none;"></div>
+      <button class="action" id="reconResultCopyBtn" onclick="copyResult('reconResult')">📋 Copy</button>
+    </div>
+  </div>
+
+  <!-- TRUSTEES -->
+  <div id="trusteesPanel" class="panel">
+    <div class="card">
+      <h3>Register a trustee</h3>
+      <label>Name</label>
+      <input type="text" id="tName">
+      <label>Email</label>
+      <input type="text" id="tEmail">
+      <label>Which secret (label) is this share for</label>
+      <input type="text" id="tLabel" placeholder="must match a label from the Secrets tab">
+      <label>Encrypted share hex</label>
+      <input type="text" id="tHex" placeholder="paste output from Keys &amp; Encryption tab">
+      <button class="action" onclick="doAddTrustee()">Add Trustee</button>
+      <div id="trusteeResult" class="result" style="display:none;"></div>
+    </div>
+    <div class="card">
+      <h3>Current trustees</h3>
+      <button class="action" onclick="loadTrustees()">Refresh</button>
+      <table id="trusteesTable"><thead><tr><th>Name</th><th>Email</th><th>Label</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <!-- KEYS -->
+  <div id="keysPanel" class="panel">
+    <div class="card">
+      <h3>1. Generate a keypair</h3>
+      <div class="hint">Run once for the owner, once for each trustee — on separate machines in real use.</div>
+      <button class="action" onclick="doKeygen()">Generate Keypair</button>
+      <div id="keygenResult" class="result" style="display:none;"></div>
+      <button class="action" id="keygenResultCopyBtn" onclick="copyResult('keygenResult')">📋 Copy</button>
+
+    </div>
+    <div class="card">
+      <h3>2. Encrypt a share (run by the owner)</h3>
+      <label>Your private key</label>
+      <input type="text" id="encMyPrivate">
+      <label>Trustee's public key</label>
+      <input type="text" id="encTheirPublic">
+      <label>Share to encrypt (x:y)</label>
+      <input type="text" id="encShare" placeholder="e.g. 1:12345">
+      <button class="action" onclick="doEncrypt()">Encrypt Share</button>
+      <div id="encryptResult" class="result" style="display:none;"></div>
+      <button class="action" id="encryptResultCopyBtn" onclick="copyResult('encryptResult')">📋 Copy</button>
+    </div>
+    <div class="card">
+      <h3>3. Decrypt a share (run by the trustee)</h3>
+      <label>Your private key</label>
+      <input type="text" id="decMyPrivate">
+      <label>Owner's public key</label>
+      <input type="text" id="decTheirPublic">
+      <label>Encrypted hex</label>
+      <input type="text" id="decHex">
+      <button class="action" onclick="doDecrypt()">Decrypt Share</button>
+      <div id="decryptResult" class="result" style="display:none;"></div>
+      <button class="action" id="decryptResultCopyBtn" onclick="copyResult('decryptResult')">📋 Copy</button>
+    </div>
+  </div>
+
+  <!-- CHAIN -->
+  <div id="chainPanel" class="panel">
+    <button class="action" onclick="loadChain()">🔄 Refresh / Verify Chain</button>
+    <div id="chainStatus">Loading...</div>
+    <div id="chainContainer" class="chain"></div>
+  </div>
+
+  <!-- POLY -->
+  <div id="polyPanel" class="panel">
+    <p style="text-align:center; color:#9fd;">Watch the curve form as shares (points) combine. f(0) is the secret.</p>
+    <canvas id="c" width="700" height="450"></canvas>
+    <div id="info">Click "Add Share" to reveal points one at a time.</div>
+    <div class="viz-btn-row">
+      <button class="action" onclick="addNextPoint()">Add Share</button>
+      <button class="action" onclick="resetPoly()">Reset</button>
+    </div>
+  </div>
+  
 <script>
-  const P = 97;
-  const SECRET = 42;
-  function f(x) {
-    return ((SECRET + 5*x + 3*x*x) % P + P) % P;
+    function showTab(name) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(name + 'Panel').classList.add('active');
+    event.target.classList.add('active');
+    if (name === 'secrets') loadSecrets();
+    if (name === 'chain') loadChain();
+    if (name === 'trustees') loadTrustees();
   }
+
+  async function api(path, body) {
+    const opts = body === undefined
+      ? {}
+      : { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) };
+    const res = await fetch(path, opts);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'request failed');
+    return data;
+  }
+
+  function showResult(elId, text, isError) {
+    const el = document.getElementById(elId);
+    el.style.display = 'block';
+    el.textContent = text;
+    el.className = 'result ' + (isError ? 'error' : 'ok');
+  }
+  
+  function copyResult(elId) {
+    const el = document.getElementById(elId);
+    navigator.clipboard.writeText(el.textContent).then(() => {
+      const btn = document.getElementById(elId + 'CopyBtn');
+      if (btn) { const orig = btn.textContent; btn.textContent = '✅ Copied'; setTimeout(() => btn.textContent = orig, 1200); }
+    });
+  }
+
+  // ---------- Switch ----------
+  async function refreshStatus() {
+    try {
+      const s = await api('/api/status');
+      const textEl = document.getElementById('switchStatusText');
+      const cd = document.getElementById('countdown');
+      const bar = document.getElementById('bar');
+      const tc = document.getElementById('trusteeCount');
+
+      if (!s.armed) {
+        textEl.textContent = 'Switch is not armed.';
+        cd.textContent = '--'; cd.className = 'countdown';
+        bar.style.width = '0%';
+      } else if (s.triggered) {
+        textEl.textContent = 'Switch has been TRIGGERED — trustees notified.';
+        cd.textContent = '🚨'; cd.className = 'countdown expired';
+        bar.style.width = '0%';
+      } else {
+        const total = s.demo_speed ? s.days : s.days * 24 * 3600;
+        const elapsed = (Date.now() / 1000) - s.last_checkin;
+        const remaining = Math.max(0, total - elapsed);
+        const unit = s.demo_speed ? 's' : 'd';
+        const display = s.demo_speed ? remaining.toFixed(1) : (remaining / 86400).toFixed(1);
+        textEl.textContent = 'Switch armed.';
+        cd.textContent = display + unit;
+        cd.className = remaining < total * 0.2 ? 'countdown expired' : 'countdown';
+        const pct = total > 0 ? Math.max(0, (remaining / total) * 100) : 0;
+        bar.style.width = pct + '%';
+        bar.className = 'bar-fill' + (pct < 20 ? ' low' : '');
+      }
+      tc.textContent = `Trustees on file: ${(s.trustees || []).length}`;
+    } catch (e) {
+      document.getElementById('switchStatusText').textContent = 'Could not reach server.';
+    }
+  }
+  setInterval(refreshStatus, 1000);
+  refreshStatus();
+
+  async function doArm() {
+    try {
+      const days = parseInt(document.getElementById('armDays').value);
+      const demo_speed = document.getElementById('armDemoSpeed').checked;
+      const force = document.getElementById('armForce').checked;
+      const r = await api('/api/arm', { days, demo_speed, force });
+      showResult('switchResult', 'Armed successfully.', false);
+      refreshStatus();
+    } catch (e) { showResult('switchResult', e.message, true); }
+  }
+
+  async function doCheckin() {
+    try {
+      await api('/api/checkin', {});
+      showResult('switchResult', 'Checked in — timer reset.', false);
+      refreshStatus();
+    } catch (e) { showResult('switchResult', e.message, true); }
+  }
+
+  async function startWatch() {
+    try {
+      const r = await api('/api/watch/start', {});
+      showResult('watchResult', r.already_running ? 'Already running.' : 'Watcher started.', false);
+    } catch (e) { showResult('watchResult', e.message, true); }
+  }
+  async function stopWatch() {
+    try {
+      await api('/api/watch/stop', {});
+      showResult('watchResult', 'Watcher stopped.', false);
+    } catch (e) { showResult('watchResult', e.message, true); }
+  }
+
+  async function doReconstruct() {
+    try {
+      const shares = document.getElementById('reconShares').value
+        .split('\\n').map(s => s.trim()).filter(Boolean);
+      const length = parseInt(document.getElementById('reconLength').value);
+      const r = await api('/api/reconstruct', { shares, length });
+      if (r.alert) {
+        showResult('reconResult', '🚨 CANARY DETECTED: ' + r.alert, true);
+      } else {
+        showResult('reconResult', 'Recovered secret: ' + r.secret, false);
+      }
+    } catch (e) { showResult('reconResult', e.message, true); }
+  }
+
+  // ---------- Secrets ----------
+  async function doSplit() {
+    try {
+      const body = {
+        secret: document.getElementById('splitSecret').value,
+        label: document.getElementById('splitLabel').value,
+        n: parseInt(document.getElementById('splitN').value),
+        k: parseInt(document.getElementById('splitK').value),
+        canaries: parseInt(document.getElementById('splitCanaries').value || '0'),
+      };
+      const r = await api('/api/split', body);
+      let text = `Label: "${r.label}"  (length=${r.length} bytes)\\n\\nReal shares:\\n`;
+      text += r.real_shares.join('\\n');
+      if (r.canary_shares.length) {
+        text += '\\n\\nDecoy (canary) shares — do NOT use to reconstruct:\\n' + r.canary_shares.join('\\n');
+      }
+      showResult('splitResult', text, false);
+    } catch (e) { showResult('splitResult', e.message, true); }
+  }
+
+  async function loadSecrets() {
+    try {
+      const r = await api('/api/list-secrets');
+      const tbody = document.querySelector('#secretsTable tbody');
+      tbody.innerHTML = '';
+      r.secrets.forEach(s => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${s.label}</td><td>${s.n}/${s.k}</td><td>${s.trustees.join(', ') || '—'}</td>`;
+        tbody.appendChild(tr);
+      });
+    } catch (e) {}
+  }
+
+  // ---------- Trustees ----------
+  async function doAddTrustee() {
+    try {
+      const body = {
+        name: document.getElementById('tName').value,
+        email: document.getElementById('tEmail').value,
+        label: document.getElementById('tLabel').value,
+        encrypted_hex: document.getElementById('tHex').value,
+      };
+      await api('/api/add-trustee', body);
+      showResult('trusteeResult', `Added trustee: ${body.name} <${body.email}>`, false);
+      loadTrustees();
+    } catch (e) { showResult('trusteeResult', e.message, true); }
+  }
+  
+  async function loadTrustees() {
+    try {
+      const r = await api('/api/trustees');
+      const tbody = document.querySelector('#trusteesTable tbody');
+      tbody.innerHTML = '';
+      r.trustees.forEach(t => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${t.name}</td><td>${t.email}</td><td>${t.label}</td>
+          <td><button class="action danger" onclick="removeTrustee('${t.name.replace(/'/g,"\\'")}','${t.label.replace(/'/g,"\\'")}')">Remove</button></td>`;
+        tbody.appendChild(tr);
+      });
+    } catch (e) {}
+  }
+
+  async function removeTrustee(name, label) {
+    try {
+      await api('/api/remove-trustee', { name, label });
+      loadTrustees();
+    } catch (e) { showResult('trusteeResult', e.message, true); }
+  }
+
+  // ---------- Keys ----------
+  async function doKeygen() {
+    try {
+      const r = await api('/api/keygen', {});
+      showResult('keygenResult', `PRIVATE (keep secret):\\n${r.private_key}\\n\\nPUBLIC (safe to share):\\n${r.public_key}`, false);
+    } catch (e) { showResult('keygenResult', e.message, true); }
+  }
+
+  async function doEncrypt() {
+    try {
+      const body = {
+        my_private: document.getElementById('encMyPrivate').value,
+        their_public: document.getElementById('encTheirPublic').value,
+        share: document.getElementById('encShare').value,
+      };
+      const r = await api('/api/encrypt-share', body);
+      showResult('encryptResult', r.encrypted_hex, false);
+    } catch (e) { showResult('encryptResult', e.message, true); }
+  }
+    async function doDecrypt() {
+    try {
+      const body = {
+        my_private: document.getElementById('decMyPrivate').value,
+        their_public: document.getElementById('decTheirPublic').value,
+        encrypted_hex: document.getElementById('decHex').value,
+      };
+      const r = await api('/api/decrypt-share', body);
+      showResult('decryptResult', 'Decrypted (verified): ' + r.decrypted, false);
+    } catch (e) { showResult('decryptResult', '🚨 ' + e.message, true); }
+  }
+
+  // ---------- Chain of Custody ----------
+  async function loadChain() {
+    const statusEl = document.getElementById('chainStatus');
+    const containerEl = document.getElementById('chainContainer');
+    statusEl.textContent = 'Loading...'; statusEl.className = '';
+    containerEl.innerHTML = '';
+    let data;
+    try { data = await api('/api/log'); }
+    catch (e) { statusEl.textContent = '⚠️ Could not reach server.'; statusEl.className = 'broken'; return; }
+
+    if (data.valid) {
+      statusEl.textContent = `✅ Audit log verified — ${data.count} entries, chain intact.`;
+      statusEl.className = 'ok';
+    } else {
+      statusEl.textContent = `🚨 TAMPERED — chain breaks at entry #${data.break_index}`;
+      statusEl.className = 'broken';
+    }
+
+    data.entries.forEach((entry, i) => {
+      const isBroken = data.break_index !== null && i >= data.break_index;
+      if (i > 0) {
+        const link = document.createElement('div');
+        link.className = 'block-link' + (isBroken ? ' broken' : '');
+        link.textContent = '↓';
+        containerEl.appendChild(link);
+      }
+      const block = document.createElement('div');
+      block.className = 'block' + (isBroken ? ' broken' : '');
+      if (entry.corrupted_raw_line) {
+        block.innerHTML = `<div class="block-event broken-event">🚨 CORRUPTED LINE</div><div class="block-details">${entry.corrupted_raw_line}</div>`;
+      } else {
+        const ts = new Date(entry.timestamp * 1000).toLocaleString();
+        block.innerHTML = `
+          <div class="block-event${isBroken ? ' broken-event' : ''}">${entry.event}</div>
+          <div class="block-meta">${ts}</div>
+          <div class="block-details">${JSON.stringify(entry.details)}</div>
+          <div class="block-meta">hash: ${entry.hash ? entry.hash.slice(0,16) : '?'}...</div>`;
+      }
+      containerEl.appendChild(block);
+    });
+    if (data.entries.length === 0) {
+      containerEl.innerHTML = '<div class="block" style="text-align:center; color:#888;">No audit log entries yet.</div>';
+    }
+  }
+
+  // ---------- Polynomial demo ----------
+  const P = 97, SECRET = 42;
+  function f(x) { return ((SECRET + 5*x + 3*x*x) % P + P) % P; }
   const allPoints = [1,2,3,4,5].map(x => [x, f(x)]);
   let revealed = [];
 
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  const padding = 40;
+  
+  const W = canvas.width, H = canvas.height, padding = 40;
 
   function toScreen(x, y) {
-    const sx = padding + (x / 6) * (W - 2*padding);
-    const sy = H - padding - (y / P) * (H - 2*padding);
-    return [sx, sy];
+      return [padding + (x/6)*(W-2*padding), H-padding-(y/P)*(H-2*padding)];
   }
 
   function drawAxes() {
-    ctx.strokeStyle = "#444";
-    ctx.beginPath();
-    ctx.moveTo(padding, H - padding);
-    ctx.lineTo(W - padding, H - padding);
-    ctx.moveTo(padding, padding);
-    ctx.lineTo(padding, H - padding);
-    ctx.stroke();
+    ctx.strokeStyle = "#444"; ctx.beginPath();
+    ctx.moveTo(padding, H-padding); ctx.lineTo(W-padding, H-padding);
+    ctx.moveTo(padding, padding); ctx.lineTo(padding, H-padding); ctx.stroke();
   }
 
   function drawPoints() {
     ctx.fillStyle = "#5cf";
-    for (const [x, y] of revealed) {
-      const [sx, sy] = toScreen(x, y);
-      ctx.beginPath();
-      ctx.arc(sx, sy, 6, 0, 2*Math.PI);
-      ctx.fill();
-    }
+    for (const [x,y] of revealed) { const [sx,sy]=toScreen(x,y); ctx.beginPath(); ctx.arc(sx,sy,6,0,2*Math.PI); ctx.fill(); }
   }
 
   function lagrangeAt(x0, points) {
     let result = 0;
-    for (let i = 0; i < points.length; i++) {
-      let [xi, yi] = points[i];
-      let num = 1, den = 1;
-      for (let j = 0; j < points.length; j++) {
-        if (i === j) continue;
-        let [xj, _] = points[j];
-        num *= (x0 - xj);
-        den *= (xi - xj);
-      }
-      result += yi * (num / den);
+    for (let i=0;i<points.length;i++){
+      let [xi,yi]=points[i]; let num=1,den=1;
+      for (let j=0;j<points.length;j++){ if(i===j)continue; let [xj,_]=points[j]; num*=(x0-xj); den*=(xi-xj); }
+      result += yi*(num/den);
     }
     return result;
   }
 
   function drawCurve() {
     if (revealed.length < 3) return;
-    ctx.strokeStyle = "#9f5";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    let first = true;
-    for (let x = 0; x <= 6; x += 0.1) {
-      const y = lagrangeAt(x, revealed);
-      if (y < 0 || y > P) { first = true; continue; }
-      const [sx, sy] = toScreen(x, y);
-      if (first) { ctx.moveTo(sx, sy); first = false; }
-      else ctx.lineTo(sx, sy);
+    ctx.strokeStyle="#9f5"; ctx.lineWidth=2; ctx.beginPath();
+    let first=true;
+    for (let x=0;x<=6;x+=0.1){
+      const y=lagrangeAt(x,revealed);
+      if (y<0||y>P){first=true;continue;}
+      const [sx,sy]=toScreen(x,y);
+      if(first){ctx.moveTo(sx,sy);first=false;} else ctx.lineTo(sx,sy);
     }
     ctx.stroke();
 
-    const [sx0, sy0] = toScreen(0, lagrangeAt(0, revealed));
-    ctx.fillStyle = "#fc5";
-    ctx.beginPath();
-    ctx.arc(sx0, sy0, 7, 0, 2*Math.PI);
-    ctx.fill();
+    const [sx0,sy0]=toScreen(0,lagrangeAt(0,revealed));
+    ctx.fillStyle="#fc5"; ctx.beginPath(); ctx.arc(sx0,sy0,7,0,2*Math.PI); ctx.fill();
   }
 
   function render() {
-    ctx.clearRect(0, 0, W, H);
-    drawAxes();
-    drawPoints();
-    drawCurve();
-    const info = document.getElementById('info');
-    if (revealed.length < 3) {
-      info.textContent = `Shares revealed: ${revealed.length} / 3 needed — curve not yet determined.`;
-    } else {
-      const secretGuess = Math.round(lagrangeAt(0, revealed));
-      info.textContent = `Curve reconstructed! f(0) = ${secretGuess} (the secret)`;
-    }
+    ctx.clearRect(0,0,W,H); drawAxes(); drawPoints(); drawCurve();
+    const info=document.getElementById('info');
+    if (revealed.length<3) info.textContent = `Shares revealed: ${revealed.length} / 3 needed.`;
+    else info.textContent = `Curve reconstructed! f(0) = ${Math.round(lagrangeAt(0,revealed))} (the secret)`;
   }
-
-  function addNextPoint() {
-    if (revealed.length < allPoints.length) {
-      revealed.push(allPoints[revealed.length]);
-      render();
-    }
-  }
-
-  function reset() {
-    revealed = [];
-    render();
-  }
+  function addNextPoint() { if(revealed.length<allPoints.length){revealed.push(allPoints[revealed.length]); render();} }
+  function resetPoly() { revealed=[]; render(); }
 
   render();
 </script>
@@ -1118,16 +1561,271 @@ VISUALIZER_HTML = """
 
 
 class VisualizerHandler(http.server.BaseHTTPRequestHandler):
-    """Serves the embedded visualizer HTML page over a local HTTP connection."""
+    """Serves the dashboard HTML and a JSON API that drives the same
+    functions the CLI uses — the web UI is a second interface, not a
+    reimplementation."""
+
+    # ---------- GET ----------
 
     def do_GET(self):
+        if self.path in ("/", ""):
+            self._send_html(VISUALIZER_HTML)
+        elif self.path == "/api/log":
+            self._handle_get_log()
+        elif self.path == "/api/status":
+            self._send_json(load_state())
+        elif self.path == "/api/list-secrets":
+            self._handle_list_secrets()
+        elif self.path == "/api/trustees":
+            self._send_json({"trustees": load_state()["trustees"]})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    # ---------- POST ----------
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            self._send_json({"error": "invalid JSON in request body"}, status=400)
+            return
+
+        try:
+            if self.path == "/api/split":
+                self._handle_split(data)
+            elif self.path == "/api/add-trustee":
+                self._handle_add_trustee(data)
+            elif self.path == "/api/arm":
+                self._handle_arm(data)
+            elif self.path == "/api/checkin":
+                self._handle_checkin(data)
+            elif self.path == "/api/keygen":
+                self._handle_keygen(data)
+            elif self.path == "/api/encrypt-share":
+                self._handle_encrypt_share(data)
+            elif self.path == "/api/decrypt-share":
+                self._handle_decrypt_share(data)
+            elif self.path == "/api/watch/start":
+                self._handle_watch_start(data)
+            elif self.path == "/api/watch/stop":
+                self._handle_watch_stop(data)
+            elif self.path == "/api/reconstruct":
+                self._handle_reconstruct(data)
+            elif self.path == "/api/remove-trustee":
+                self._handle_remove_trustee(data)
+            else:
+                self._send_json({"error": "unknown endpoint"}, status=404)
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=400)
+
+    # ---------- handlers (each mirrors the matching cli_* function) ----------
+
+    def _handle_split(self, data):
+        field = FiniteField()
+        sss = ShamirSecretSharing(field)
+        trap = CanaryTrap(field)
+
+        secret = str(data["secret"])
+        label = str(data["label"])
+        n = int(data["n"])
+        k = int(data["k"])
+        canaries = int(data.get("canaries", 0))
+
+        secret_bytes = secret.encode("utf-8")
+        secret_int = secret_to_int(secret_bytes)
+        if secret_int >= field.p:
+            self._send_json({"error": "secret is too large for the current field"}, status=400)
+            return
+
+        shares = sss.split(secret_int, n=n, k=k)
+        canary_shares = trap.generate_canaries(canaries)
+
+        audit_log("split", {"label": label, "n": n, "k": k, "canaries": canaries,
+                             "secret_length_bytes": len(secret_bytes)})
+
+        state = load_state()
+        state["secrets"].append({
+            "label": label, "n": n, "k": k, "canaries": canaries,
+            "secret_length_bytes": len(secret_bytes), "timestamp": time.time(),
+        })
+        save_state(state)
+
+        self._send_json({
+            "label": label,
+            "length": len(secret_bytes),
+            "real_shares": [format_share(s) for s in shares],
+            "canary_shares": [format_share(s) for s in canary_shares],
+        })
+
+    def _handle_add_trustee(self, data):
+        state = load_state()
+        entry = {
+            "name": str(data["name"]),
+            "email": str(data["email"]),
+            "encrypted_share_hex": str(data["encrypted_hex"]),
+            "label": str(data["label"]),
+        }
+        state["trustees"].append(entry)
+        save_state(state)
+        audit_log("add_trustee", {"name": entry["name"], "email": entry["email"], "label": entry["label"]})
+        self._send_json({"ok": True, "trustee": entry})
+
+    def _handle_arm(self, data):
+        state = load_state()
+        force = bool(data.get("force", False))
+        if state["armed"] and not force:
+            self._send_json({"error": "already armed — pass force=true to re-arm"}, status=400)
+            return
+
+        days = int(data["days"])
+        demo_speed = bool(data.get("demo_speed", False))
+
+        state["armed"] = True
+        state["days"] = days
+        state["demo_speed"] = demo_speed
+        state["last_checkin"] = time.time()
+        state["triggered"] = False
+        state["reminder_sent"] = False
+        save_state(state)
+        audit_log("arm", {"days": days, "demo_speed": demo_speed})
+        self._send_json({"ok": True, "state": state})
+
+    def _handle_checkin(self, data):
+        state = load_state()
+        if not state["armed"]:
+            self._send_json({"error": "no switch is armed"}, status=400)
+            return
+        if state["triggered"]:
+            self._send_json({"error": "already triggered — re-arm first"}, status=400)
+            return
+        state["last_checkin"] = time.time()
+        state["reminder_sent"] = False
+        save_state(state)
+        audit_log("checkin", {})
+        self._send_json({"ok": True, "state": state})
+
+    def _handle_keygen(self, data):
+        dh = DiffieHellman()
+        # Transmitted as STRINGS, not JSON numbers — these integers are
+        # far bigger than JavaScript can represent exactly as a Number,
+        # so treating them as text avoids silent precision loss.
+        self._send_json({
+            "private_key": str(dh.private_key),
+            "public_key": str(dh.public_key()),
+        })
+
+    def _handle_encrypt_share(self, data):
+        dh = DiffieHellman()
+        dh.private_key = int(data["my_private"])
+        shared = dh.shared_secret(int(data["their_public"]))
+        enc_key, mac_key = derive_keys(shared)
+        payload = encrypt_then_mac(str(data["share"]).encode(), enc_key, mac_key)
+        self._send_json({"encrypted_hex": payload.hex()})
+
+    def _handle_decrypt_share(self, data):
+        dh = DiffieHellman()
+        dh.private_key = int(data["my_private"])
+        shared = dh.shared_secret(int(data["their_public"]))
+        enc_key, mac_key = derive_keys(shared)
+        payload = bytes.fromhex(str(data["encrypted_hex"]))
+        try:
+            decrypted = decrypt_then_verify(payload, enc_key, mac_key)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        self._send_json({"decrypted": decrypted.decode()})
+
+    def _handle_get_log(self):
+        entries = []
+        if AUDIT_LOG_PATH.exists():
+            with open(AUDIT_LOG_PATH, "r", encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            entries.append({"corrupted_raw_line": line})
+        valid, count, break_index = verify_audit_log()
+        self._send_json({"entries": entries, "valid": valid, "count": count, "break_index": break_index})
+
+    def _handle_list_secrets(self):
+        state = load_state()
+        result = []
+        for s in state["secrets"]:
+            trustees = [t["name"] for t in state["trustees"] if t.get("label") == s["label"]]
+            result.append({**s, "trustees": trustees})
+        self._send_json({"secrets": result})
+        
+    def _handle_watch_start(self, data):
+        global _watch_thread, _watch_thread_stop
+        if _watch_thread is not None and _watch_thread.is_alive():
+            self._send_json({"ok": True, "already_running": True})
+            return
+        _watch_thread_stop.clear()
+        _watch_thread = threading.Thread(target=_watch_loop_background, daemon=True)
+        _watch_thread.start()
+        self._send_json({"ok": True, "started": True})
+
+    def _handle_watch_stop(self, data):
+        global _watch_thread_stop
+        _watch_thread_stop.set()
+        self._send_json({"ok": True, "stopped": True})
+        
+    def _handle_reconstruct(self, data):
+        field = FiniteField()
+        sss = ShamirSecretSharing(field)
+        trap = CanaryTrap(field)
+
+        shares = [parse_share(s) for s in data["shares"]]
+        tripped = trap.check_for_tripwire(shares)
+        if tripped:
+            audit_log("canary_tripped", {"canary_x_values": [x for x, y in tripped]})
+            self._send_json({"alert": f"{len(tripped)} decoy share(s) used — leaked or coerced share detected."})
+            return
+
+        recovered_int = sss.reconstruct(shares)
+        recovered_bytes = int_to_secret(recovered_int, int(data["length"]))
+        audit_log("reconstruct_attempt", {"share_count": len(shares)})
+        try:
+            self._send_json({"secret": recovered_bytes.decode("utf-8")})
+        except UnicodeDecodeError:
+            self._send_json({"secret": recovered_bytes.hex(), "raw_hex": True})
+            
+    def _handle_remove_trustee(self, data):
+        state = load_state()
+        name = str(data["name"])
+        label = data.get("label")
+        before = len(state["trustees"])
+        if label:
+            state["trustees"] = [t for t in state["trustees"]
+                                  if not (t["name"] == name and t.get("label") == label)]
+        else:
+            state["trustees"] = [t for t in state["trustees"] if t["name"] != name]
+        removed = before - len(state["trustees"])
+        save_state(state)
+        audit_log("remove_trustee", {"name": name, "label": label, "removed_count": removed})
+        self._send_json({"ok": True, "removed": removed})
+
+    # ---------- response helpers ----------
+
+    def _send_html(self, html):
         self.send_response(200)
         self.send_header("Content-type", "text/html; charset=utf-8")
         self.end_headers()
-        self.wfile.write(VISUALIZER_HTML.encode())
+        self.wfile.write(html.encode())
+
+    def _send_json(self, payload, status=200):
+        body = json.dumps(payload, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
-        pass  # silence default request logging, keep terminal clean
+        pass
 
 
 # =============================================================================
@@ -1216,8 +1914,38 @@ def build_cli():
 
     showlog_parser = subparsers.add_parser("show-log", help="Print the audit log in human-readable form")
     showlog_parser.set_defaults(func=cli_show_log)
+    
+    remove_trustee_parser = subparsers.add_parser("remove-trustee", help="Remove a trustee by name")
+    remove_trustee_parser.add_argument("--name", required=True)
+    remove_trustee_parser.add_argument("--label", default=None,
+                                        help="Optional: only remove the entry for this specific secret label")
+    remove_trustee_parser.set_defaults(func=cli_remove_trustee)
 
     return parser
+
+def _watch_loop_background():
+    """Same logic as cli_watch, but runs in a background thread instead
+    of blocking a terminal — lets the dashboard drive the check-in daemon."""
+    while not _watch_thread_stop.is_set():
+        state = load_state()
+        if not state["armed"] or state["triggered"]:
+            time.sleep(1)
+            continue
+
+        elapsed = time.time() - state["last_checkin"]
+        total = window_seconds(state["days"], state["demo_speed"])
+        remaining = total - elapsed
+
+        if remaining <= 0:
+            trigger_switch(state)
+            continue
+
+        if not state["reminder_sent"] and total > 0 and (remaining / total) < REMINDER_THRESHOLD:
+            send_owner_reminder(state)
+            state["reminder_sent"] = True
+            save_state(state)
+
+        time.sleep(1)
 
 
 # =============================================================================

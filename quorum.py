@@ -1,3 +1,4 @@
+#quorum.py
 """
 Quorum — a stdlib-only dead-man's-switch secret sharing tool.
 
@@ -13,7 +14,7 @@ Track E — Security & Crypto Utilities.
 Zero third-party runtime dependencies — Python standard library only:
     secrets, hashlib, http.server, socketserver, webbrowser, threading,
     argparse, json, os, sys, time, smtplib, ssl, subprocess,
-    email.message, pathlib
+    email.message, pathlib, http.cookies
 """
 
 # =============================================================================
@@ -35,6 +36,7 @@ import threading
 import time
 import webbrowser
 from email.message import EmailMessage
+from http.cookies import SimpleCookie
 from pathlib import Path
 
 
@@ -146,6 +148,7 @@ class ShamirSecretSharing:
         if k > n:
             raise ValueError("threshold k cannot exceed number of shares n")
         poly = Polynomial(secret, degree=k - 1, field=self.field)
+        self.last_polynomial = poly
         # x-coordinates 1..n — never use x=0, that's the secret itself.
         return [(x, poly.evaluate(x)) for x in range(1, n + 1)]
 
@@ -672,8 +675,9 @@ def load_env_file():
     Optional convenience loader: reads KEY=VALUE lines from quorum.env
     (if it exists) and sets them as environment variables.
 
-    quorum.env must NEVER be committed — it holds real email credentials.
-    It is data, not source code, so it doesn't count against the single-file
+    quorum.env must NEVER be committed — it holds real email credentials
+    and (as of this patch) the dashboard's owner/trustee passphrases. It
+    is data, not source code, so it doesn't count against the single-file
     rule; it must still be listed in .gitignore.
     """
     if not ENV_FILE_PATH.exists():
@@ -685,6 +689,62 @@ def load_env_file():
                 continue
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip())
+
+
+def notify_trustee_credential(name, email, credential):
+    """Send a newly generated Quorum login credential to a trustee."""
+
+    host = os.environ.get("QUORUM_SMTP_HOST")
+    port = os.environ.get("QUORUM_SMTP_PORT")
+    user = os.environ.get("QUORUM_SMTP_USER")
+    password = os.environ.get("QUORUM_SMTP_PASS")
+
+    subject = "Quorum: Your Trustee Login Credential"
+
+    body = (
+        f"Hi {name},\n\n"
+        f"You have been added as a trustee in Quorum.\n\n"
+        f"Your login credential is:\n\n"
+        f"{credential}\n\n"
+        f"Open the Quorum dashboard, select 'Trustee', "
+        f"and enter this credential to sign in.\n\n"
+        f"Keep this credential private.\n\n"
+        f"— Quorum"
+    )
+
+    if host and port and user and password:
+        try:
+            _send_email(
+                host,
+                int(port),
+                user,
+                password,
+                email,
+                subject,
+                body
+            )
+
+            audit_log("trustee_credential_sent", {
+                "trustee": name,
+                "method": "smtp"
+            })
+
+            print(f"  ✅ Trustee credential emailed to {name} <{email}>")
+            return
+
+        except Exception as e:
+            print(f"  ⚠️ Credential email failed for {name}: {e}")
+
+    # Demo fallback
+    trustee = {"name": name, "email": email}
+    _log_to_mailbox(trustee, subject, body)
+
+    audit_log("trustee_credential_sent", {
+        "trustee": name,
+        "method": "local_log"
+    })
+
+    print(f"  📝 Credential logged for {name} to {MAILBOX_LOG_PATH}")
 
 
 def notify_trustee(trustee):
@@ -770,7 +830,8 @@ def cli_add_trustee(args):
     save_state(state)
     audit_log("add_trustee", {"name": args.name, "email": args.email, "label": args.label})
     print(f"Added trustee: {args.name} <{args.email}> — share for: \"{args.label}\"")
-    
+
+
 def cli_remove_trustee(args):
     """Remove a trustee by name (and optionally label, if names collide)."""
     state = load_state()
@@ -998,6 +1059,184 @@ def cli_visualize(args):
 
 
 # =============================================================================
+# Dashboard authentication — passphrase-gated owner/trustee sessions (Bug 5)
+# =============================================================================
+#
+# A client-side Owner/Trustee toggle alone doesn't stop someone from calling
+# /api/split or /api/arm directly (e.g. with curl), bypassing the UI. This
+# adds a real server-side gate: a role passphrase — set in quorum.env, the
+# same place SMTP creds already live — is verified with the same hardened
+# KDF used for share encryption (PBKDF2-HMAC-SHA256), and a random session
+# token is issued as an HttpOnly cookie. Every state-changing API endpoint
+# checks the session's role against ROLE_MAP before running, so a curl call
+# with no valid session now gets a 401 — not a page that just hides a button.
+#
+# This is deliberately simple (in-memory sessions, single process) — that's
+# honestly documented in THREAT_MODEL.md rather than overclaimed. It is not
+# meant to replace the real design (owner and each trustee running this
+# dashboard on their own separate machine); it fixes the specific hole of
+# "the UI toggle is the only thing stopping a Trustee session from acting
+# as Owner."
+
+AUTH_SALT_PATH = Path("quorum_auth_salt.bin")
+SESSION_TTL_SECONDS = 60 * 60 * 4  # 4 hours — plenty for a demo, short enough to be honest
+
+_sessions = {}       # token -> {"role": "owner"|"trustee", "expires": float}
+ROLE_HASHES = None   # populated at startup by _load_or_generate_passphrases()
+
+
+def _get_or_create_auth_salt():
+    """Persisted alongside quorum_state.json so passphrase hashes stay
+    stable across restarts."""
+    if AUTH_SALT_PATH.exists():
+        return AUTH_SALT_PATH.read_bytes()
+    salt = secrets.token_bytes(16)
+    AUTH_SALT_PATH.write_bytes(salt)
+    return salt
+
+
+def _load_or_generate_passphrases():
+    """
+    Reads QUORUM_OWNER_PASSPHRASE / QUORUM_TRUSTEE_PASSPHRASE from
+    quorum.env (already loaded into os.environ by load_env_file()). If
+    either is missing, generates one for this run and prints it once, so
+    a demo never hard-fails on missing config — the same fallback pattern
+    already used for SMTP credentials.
+    """
+    owner_pass = os.environ.get("QUORUM_OWNER_PASSPHRASE")
+    trustee_pass = os.environ.get("QUORUM_TRUSTEE_PASSPHRASE")
+    generated = []
+
+    if not owner_pass:
+        owner_pass = secrets.token_urlsafe(9)
+        generated.append(("QUORUM_OWNER_PASSPHRASE", owner_pass))
+    if not trustee_pass:
+        trustee_pass = secrets.token_urlsafe(9)
+        generated.append(("QUORUM_TRUSTEE_PASSPHRASE", trustee_pass))
+
+    if generated:
+        print("\n[Quorum] No dashboard passphrase(s) found in quorum.env — generated for this session:")
+        for key, val in generated:
+            print(f"    {key}={val}")
+        print("[Quorum] Add these to quorum.env to keep them stable across restarts.\n")
+
+    salt = _get_or_create_auth_salt()
+    return {
+        "owner": hashlib.pbkdf2_hmac("sha256", owner_pass.encode(), salt, 100_000),
+        "trustee": hashlib.pbkdf2_hmac("sha256", trustee_pass.encode(), salt, 100_000),
+    }
+
+
+def _verify_passphrase(role, passphrase):
+    if role == "owner":
+        if not ROLE_HASHES or "owner" not in ROLE_HASHES:
+            return None
+
+        salt = _get_or_create_auth_salt()
+
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256",
+            passphrase.encode(),
+            salt,
+            100_000
+        )
+
+        if hmac.compare_digest(candidate, ROLE_HASHES["owner"]):
+            return {"role": "owner"}
+
+        return None
+
+    if role == "trustee":
+        state = load_state()
+        salt = _get_or_create_auth_salt()
+
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256",
+            passphrase.encode(),
+            salt,
+            100_000
+        ).hex()
+
+        for trustee in state.get("trustees", []):
+            stored_hash = trustee.get("credential_hash")
+
+            if stored_hash and hmac.compare_digest(
+                candidate,
+                stored_hash
+            ):
+                return {
+                    "role": "trustee",
+                    "trustee_name": trustee["name"],
+                    "trustee_email": trustee["email"],
+                    "label": trustee.get("label", "Unlabeled secret")
+                }
+
+        return None
+
+    return None
+
+
+def _create_session(role):
+    token = secrets.token_hex(32)
+    _sessions[token] = {"role": role, "expires": time.time() + SESSION_TTL_SECONDS}
+    return token
+
+
+def _session_role(cookie_header):
+    """Returns 'owner' | 'trustee' | None from a request's Cookie header."""
+    if not cookie_header:
+        return None
+    jar = SimpleCookie()
+    jar.load(cookie_header)
+    morsel = jar.get("quorum_session")
+    if not morsel:
+        return None
+    session = _sessions.get(morsel.value)
+    if not session:
+        return None
+    if session["expires"] < time.time():
+        _sessions.pop(morsel.value, None)
+        return None
+    return session["role"]
+
+
+# Which role(s) each state-changing endpoint requires. Read-only GET
+# endpoints (status/log/list-secrets/trustees) are left open so the
+# dashboard's live countdown and audit-log view work even pre-login.
+ROLE_MAP = {
+    "/api/split": {"owner"},
+    "/api/add-trustee": {"owner"},
+    "/api/remove-trustee": {"owner"},
+    "/api/arm": {"owner"},
+    "/api/checkin": {"owner"},
+    "/api/keygen": {"owner", "trustee"},
+    "/api/encrypt-share": {"owner"},
+    "/api/decrypt-share": {"trustee"},
+    "/api/reconstruct": {"trustee"},
+    "/api/watch/start": {"owner"},
+    "/api/watch/stop": {"owner"},
+}
+
+
+def _require_role(handler, path):
+    """
+    Returns True if the request may proceed. Otherwise writes a 401 JSON
+    response (via the handler's own _send_json) and returns False.
+    /api/login and /api/visualize-demo aren't in ROLE_MAP, so they always
+    pass through — login obviously can't require a session, and the demo
+    visualizer touches no real secrets or state.
+    """
+    required = ROLE_MAP.get(path)
+    if required is None:
+        return True
+    role = _session_role(handler.headers.get("Cookie"))
+    if role not in required:
+        handler._send_json({"error": "unauthorized", "required_role": sorted(required)}, status=401)
+        return False
+    return True
+
+
+# =============================================================================
 # Live polynomial visualizer (embedded HTML, served via stdlib http.server)
 # =============================================================================
 
@@ -1008,7 +1247,7 @@ VISUALIZER_HTML = """
 <meta charset="UTF-8">
 <title>Quorum Dashboard</title>
 <style>
-    * { box-sizing: border-box; }
+  * { box-sizing: border-box; }
   body {
     font-family: -apple-system, sans-serif; background: #0d0d0d; color: #eee;
     margin: 0; padding: 30px 20px;
@@ -1027,7 +1266,7 @@ VISUALIZER_HTML = """
   .card { background: #161616; border: 1px solid #2a2a2a; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
   .card h3 { margin-top: 0; color: #9fd; font-size: 15px; }
   label { display: block; font-size: 12px; color: #999; margin-top: 10px; margin-bottom: 4px; }
-  input[type=text], input[type=number], textarea {
+  input[type=text], input[type=number], input[type=password], textarea, select {
     width: 100%; background: #0d0d0d; border: 1px solid #333; color: #eee;
     padding: 8px 10px; border-radius: 5px; font-size: 13px; font-family: monospace;
   }
@@ -1044,6 +1283,11 @@ VISUALIZER_HTML = """
   .share-line { padding: 4px 0; border-bottom: 1px solid #222; cursor: pointer; }
   .share-line:hover { color: #9f5; }
   .hint { font-size: 11px; color: #666; margin-top: 4px; }
+  .role-badge {
+    text-align: center; font-size: 12px; color: #9fd; margin-bottom: 14px;
+  }
+  .role-badge button { background: none; border: none; color: #888; text-decoration: underline;
+    cursor: pointer; font-size: 12px; margin-left: 8px; }
 
   /* status */
   .status-big { text-align: center; padding: 20px; }
@@ -1080,155 +1324,236 @@ VISUALIZER_HTML = """
   <h1>Quorum</h1>
   <div class="subtitle">Dead-man's-switch secret sharing — live control panel</div>
 
-  <div class="tabs">
-    <button class="tab-btn active" onclick="showTab('switch')">Switch</button>
-    <button class="tab-btn" onclick="showTab('secrets')">Secrets</button>
-    <button class="tab-btn" onclick="showTab('trustees')">Trustees</button>
-    <button class="tab-btn" onclick="showTab('keys')">Keys &amp; Encryption</button>
-    <button class="tab-btn" onclick="showTab('chain')">Chain of Custody</button>
-    <button class="tab-btn" onclick="showTab('poly')">Polynomial Demo</button>
+  <!-- LOGIN GATE -->
+  <div id="loginGate" class="card" style="max-width:380px;margin:0 auto 20px;">
+    <h3>Sign in</h3>
+    <div class="hint">
+      In real use, the owner and each trustee run this dashboard on their own
+      separate machine — this login simulates that separation for a
+      single-machine demo, and is enforced by the server, not just the UI.
+    </div>
+    <label>Role</label>
+    <select id="loginRole">
+      <option value="owner">Owner</option>
+      <option value="trustee">Trustee</option>
+    </select>
+    <label>Passphrase</label>
+    <input type="password" id="loginPass">
+    <button class="action" onclick="doLogin()">Sign in</button>
+    <div id="loginResult" class="result" style="display:none;"></div>
   </div>
 
-  <!-- SWITCH -->
-  <div id="switchPanel" class="panel active">
-    <div class="card status-big">
-      <div id="switchStatusText">Loading...</div>
-      <div class="countdown" id="countdown">--</div>
-      <div class="bar-bg"><div class="bar-fill" id="bar" style="width:0%"></div></div>
-      <div class="hint" id="trusteeCount"></div>
+  <div id="dashboardRoot" style="display:none;">
+    <div class="role-badge">
+      Signed in as <strong id="roleLabel"></strong>
+      <button onclick="doLogout()">sign out</button>
     </div>
-    <div class="card">
-      <h3>Background watcher</h3>
-      <div class="hint">Must be running for reminders/triggers to actually fire — the countdown above is just a display.</div>
-      <button class="action" onclick="startWatch()">▶ Start Watching</button>
-      <button class="action danger" onclick="stopWatch()">■ Stop Watching</button>
-      <div id="watchResult" class="result" style="display:none;"></div>
+
+    <div class="tabs">
+      <button class="tab-btn active" onclick="showTab('switch')">Switch</button>
+      <button class="tab-btn" onclick="showTab('secrets')">Secrets</button>
+      <button class="tab-btn" onclick="showTab('trustees')">Trustees</button>
+      <button class="tab-btn" onclick="showTab('keys')">Keys &amp; Encryption</button>
+      <button class="tab-btn" onclick="showTab('chain')">Chain of Custody</button>
+      <button class="tab-btn" onclick="showTab('poly')">Polynomial Demo</button>
     </div>
-    <div class="card">
-      <h3>Arm the switch</h3>
-      <label>Window (days, or seconds if demo speed)</label>
-      <input type="number" id="armDays" value="30">
-      <label><input type="checkbox" id="armDemoSpeed" checked> Demo speed (treat as seconds)</label>
-      <label><input type="checkbox" id="armForce"> Force re-arm if already armed</label>
-      <button class="action" onclick="doArm()">Arm Switch</button>
-      <button class="action" onclick="doCheckin()">Check In</button>
-      <div id="switchResult" class="result" style="display:none;"></div>
+
+    <!-- SWITCH -->
+    <div id="switchPanel" class="panel active">
+      <div class="card status-big">
+        <div id="switchStatusText">Loading...</div>
+        <div class="countdown" id="countdown">--</div>
+        <div class="bar-bg"><div class="bar-fill" id="bar" style="width:0%"></div></div>
+        <div class="hint" id="trusteeCount"></div>
+      </div>
+      <div class="card" data-role="owner">
+        <h3>Background watcher</h3>
+        <div class="hint">Must be running for reminders/triggers to actually fire — the countdown above is just a display.</div>
+        <button class="action" onclick="startWatch()">▶ Start Watching</button>
+        <button class="action danger" onclick="stopWatch()">■ Stop Watching</button>
+        <div id="watchResult" class="result" style="display:none;"></div>
+      </div>
+      <div class="card" data-role="owner">
+        <h3>Arm the switch</h3>
+        <label>Window (days, or seconds if demo speed)</label>
+        <input type="number" id="armDays" value="30">
+        <label><input type="checkbox" id="armDemoSpeed" checked> Demo speed (treat as seconds)</label>
+        <label><input type="checkbox" id="armForce"> Force re-arm if already armed</label>
+        <button class="action" onclick="doArm()">Arm Switch</button>
+        <button class="action" onclick="doCheckin()">Check In</button>
+        <div id="switchResult" class="result" style="display:none;"></div>
+      </div>
+    </div>
+
+    <!-- SECRETS -->
+    <div id="secretsPanel" class="panel">
+      <div class="card" data-role="owner">
+        <h3>Split a new secret</h3>
+        <label>Secret</label>
+        <input type="text" id="splitSecret" placeholder="e.g. wallet-seed-xyz">
+        <label>Label (what this secret IS)</label>
+        <input type="text" id="splitLabel" placeholder="e.g. Crypto wallet seed">
+        <label>N (total shares)</label>
+        <input type="number" id="splitN" value="5">
+        <label>K (threshold to reconstruct)</label>
+        <input type="number" id="splitK" value="3">
+        <label>Canary (decoy) shares</label>
+        <input type="number" id="splitCanaries" value="1">
+        <button class="action" onclick="doSplit()">Split Secret</button>
+        <div id="splitResult" class="result" style="display:none;"></div>
+        <button class="action" id="splitResultCopyBtn" onclick="copyResult('splitResult')">📋 Copy</button>
+      </div>
+      <div class="card">
+        <h3>All secrets on file</h3>
+        <button class="action" onclick="loadSecrets()">Refresh</button>
+        <table id="secretsTable"><thead><tr><th>Label</th><th>N/K</th><th>Trustees</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="card" data-role="trustee">
+        <h3>Assigned Secret</h3>
+        <div id="trusteeSecretLabel">—</div>
+      </div>
+      <div class="card" data-role="trustee">
+        <h3>Reconstruct a secret (trustees do this)</h3>
+        <label>Shares (one per line, format x:y)</label>
+        <textarea id="reconShares" rows="4" placeholder="1:2322588...&#10;2:4645176..."></textarea>
+        <label>Secret length in bytes (shown when it was split)</label>
+        <input type="number" id="reconLength">
+        <button class="action" onclick="doReconstruct()">Reconstruct</button>
+        <div id="reconResult" class="result" style="display:none;"></div>
+        <button class="action" id="reconResultCopyBtn" onclick="copyResult('reconResult')">📋 Copy</button>
+      </div>
+    </div>
+
+    <!-- TRUSTEES -->
+    <div id="trusteesPanel" class="panel">
+      <div class="card" data-role="owner">
+        <h3>Register a trustee</h3>
+        <label>Name</label>
+        <input type="text" id="tName">
+        <label>Email</label>
+        <input type="text" id="tEmail">
+        <label>Which secret (label) is this share for</label>
+        <input type="text" id="tLabel" placeholder="must match a label from the Secrets tab">
+        <label>Encrypted share hex</label>
+        <input type="text" id="tHex" placeholder="paste output from Keys &amp; Encryption tab">
+        <button class="action" onclick="doAddTrustee()">Add Trustee</button>
+        <div id="trusteeResult" class="result" style="display:none;"></div>
+      </div>
+      <div class="card" data-role="owner">
+        <h3>Current trustees</h3>
+        <button class="action" onclick="loadTrustees()">Refresh</button>
+        <table id="trusteesTable"><thead><tr><th>Name</th><th>Email</th><th>Label</th><th></th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <!-- KEYS -->
+    <div id="keysPanel" class="panel">
+      <div class="card">
+        <h3>1. Generate a keypair</h3>
+        <div class="hint">Run once for the owner, once for each trustee — on separate machines in real use.</div>
+        <button class="action" onclick="doKeygen()">Generate Keypair</button>
+        <div id="keygenResult" class="result" style="display:none;"></div>
+        <button class="action" id="keygenResultCopyBtn" onclick="copyResult('keygenResult')">📋 Copy</button>
+
+      </div>
+      <div class="card" data-role="owner">
+        <h3>2. Encrypt a share (run by the owner)</h3>
+        <label>Your private key</label>
+        <input type="text" id="encMyPrivate">
+        <label>Trustee's public key</label>
+        <input type="text" id="encTheirPublic">
+        <label>Share to encrypt (x:y)</label>
+        <input type="text" id="encShare" placeholder="e.g. 1:12345">
+        <button class="action" onclick="doEncrypt()">Encrypt Share</button>
+        <div id="encryptResult" class="result" style="display:none;"></div>
+        <button class="action" id="encryptResultCopyBtn" onclick="copyResult('encryptResult')">📋 Copy</button>
+      </div>
+      <div class="card" data-role="trustee">
+        <h3>3. Decrypt a share (run by the trustee)</h3>
+        <label>Your private key</label>
+        <input type="text" id="decMyPrivate">
+        <label>Owner's public key</label>
+        <input type="text" id="decTheirPublic">
+        <label>Encrypted hex</label>
+        <input type="text" id="decHex">
+        <button class="action" onclick="doDecrypt()">Decrypt Share</button>
+        <div id="decryptResult" class="result" style="display:none;"></div>
+        <button class="action" id="decryptResultCopyBtn" onclick="copyResult('decryptResult')">📋 Copy</button>
+      </div>
+    </div>
+
+    <!-- CHAIN -->
+    <div id="chainPanel" class="panel">
+      <button class="action" onclick="loadChain()">🔄 Refresh / Verify Chain</button>
+      <div id="chainStatus">Loading...</div>
+      <div id="chainContainer" class="chain"></div>
+    </div>
+
+    <!-- POLY -->
+    <div id="polyPanel" class="panel">
+      <p style="text-align:center; color:#9fd;">Watch the curve form as shares (points) combine. f(0) is the secret.</p>
+      <p style="text-align:center; color:#666; font-size:12px;">These points come from a real ShamirSecretSharing.split() call on a small demo field (p=97) — same code as production, not hardcoded.</p>
+      <canvas id="c" width="700" height="450"></canvas>
+      <div id="info">Loading real share data...</div>
+      <div class="viz-btn-row">
+        <button class="action" onclick="addNextPoint()">Add Share</button>
+        <button class="action" onclick="resetPoly()">Reset</button>
+      </div>
     </div>
   </div>
 
-  <!-- SECRETS -->
-  <div id="secretsPanel" class="panel">
-    <div class="card">
-      <h3>Split a new secret</h3>
-      <label>Secret</label>
-      <input type="text" id="splitSecret" placeholder="e.g. wallet-seed-xyz">
-      <label>Label (what this secret IS)</label>
-      <input type="text" id="splitLabel" placeholder="e.g. Crypto wallet seed">
-      <label>N (total shares)</label>
-      <input type="number" id="splitN" value="5">
-      <label>K (threshold to reconstruct)</label>
-      <input type="number" id="splitK" value="3">
-      <label>Canary (decoy) shares</label>
-      <input type="number" id="splitCanaries" value="1">
-      <button class="action" onclick="doSplit()">Split Secret</button>
-      <div id="splitResult" class="result" style="display:none;"></div>
-      <button class="action" id="splitResultCopyBtn" onclick="copyResult('splitResult')">📋 Copy</button>
-    </div>
-    <div class="card">
-      <h3>All secrets on file</h3>
-      <button class="action" onclick="loadSecrets()">Refresh</button>
-      <table id="secretsTable"><thead><tr><th>Label</th><th>N/K</th><th>Trustees</th></tr></thead><tbody></tbody></table>
-    </div>
-    <div class="card">
-      <h3>Reconstruct a secret (trustees do this)</h3>
-      <label>Shares (one per line, format x:y)</label>
-      <textarea id="reconShares" rows="4" placeholder="1:2322588...&#10;2:4645176..."></textarea>
-      <label>Secret length in bytes (shown when it was split)</label>
-      <input type="number" id="reconLength">
-      <button class="action" onclick="doReconstruct()">Reconstruct</button>
-      <div id="reconResult" class="result" style="display:none;"></div>
-      <button class="action" id="reconResultCopyBtn" onclick="copyResult('reconResult')">📋 Copy</button>
-    </div>
-  </div>
-
-  <!-- TRUSTEES -->
-  <div id="trusteesPanel" class="panel">
-    <div class="card">
-      <h3>Register a trustee</h3>
-      <label>Name</label>
-      <input type="text" id="tName">
-      <label>Email</label>
-      <input type="text" id="tEmail">
-      <label>Which secret (label) is this share for</label>
-      <input type="text" id="tLabel" placeholder="must match a label from the Secrets tab">
-      <label>Encrypted share hex</label>
-      <input type="text" id="tHex" placeholder="paste output from Keys &amp; Encryption tab">
-      <button class="action" onclick="doAddTrustee()">Add Trustee</button>
-      <div id="trusteeResult" class="result" style="display:none;"></div>
-    </div>
-    <div class="card">
-      <h3>Current trustees</h3>
-      <button class="action" onclick="loadTrustees()">Refresh</button>
-      <table id="trusteesTable"><thead><tr><th>Name</th><th>Email</th><th>Label</th><th></th></tr></thead><tbody></tbody></table>
-    </div>
-  </div>
-
-  <!-- KEYS -->
-  <div id="keysPanel" class="panel">
-    <div class="card">
-      <h3>1. Generate a keypair</h3>
-      <div class="hint">Run once for the owner, once for each trustee — on separate machines in real use.</div>
-      <button class="action" onclick="doKeygen()">Generate Keypair</button>
-      <div id="keygenResult" class="result" style="display:none;"></div>
-      <button class="action" id="keygenResultCopyBtn" onclick="copyResult('keygenResult')">📋 Copy</button>
-
-    </div>
-    <div class="card">
-      <h3>2. Encrypt a share (run by the owner)</h3>
-      <label>Your private key</label>
-      <input type="text" id="encMyPrivate">
-      <label>Trustee's public key</label>
-      <input type="text" id="encTheirPublic">
-      <label>Share to encrypt (x:y)</label>
-      <input type="text" id="encShare" placeholder="e.g. 1:12345">
-      <button class="action" onclick="doEncrypt()">Encrypt Share</button>
-      <div id="encryptResult" class="result" style="display:none;"></div>
-      <button class="action" id="encryptResultCopyBtn" onclick="copyResult('encryptResult')">📋 Copy</button>
-    </div>
-    <div class="card">
-      <h3>3. Decrypt a share (run by the trustee)</h3>
-      <label>Your private key</label>
-      <input type="text" id="decMyPrivate">
-      <label>Owner's public key</label>
-      <input type="text" id="decTheirPublic">
-      <label>Encrypted hex</label>
-      <input type="text" id="decHex">
-      <button class="action" onclick="doDecrypt()">Decrypt Share</button>
-      <div id="decryptResult" class="result" style="display:none;"></div>
-      <button class="action" id="decryptResultCopyBtn" onclick="copyResult('decryptResult')">📋 Copy</button>
-    </div>
-  </div>
-
-  <!-- CHAIN -->
-  <div id="chainPanel" class="panel">
-    <button class="action" onclick="loadChain()">🔄 Refresh / Verify Chain</button>
-    <div id="chainStatus">Loading...</div>
-    <div id="chainContainer" class="chain"></div>
-  </div>
-
-  <!-- POLY -->
-  <div id="polyPanel" class="panel">
-    <p style="text-align:center; color:#9fd;">Watch the curve form as shares (points) combine. f(0) is the secret.</p>
-    <canvas id="c" width="700" height="450"></canvas>
-    <div id="info">Click "Add Share" to reveal points one at a time.</div>
-    <div class="viz-btn-row">
-      <button class="action" onclick="addNextPoint()">Add Share</button>
-      <button class="action" onclick="resetPoly()">Reset</button>
-    </div>
-  </div>
-  
 <script>
-    function showTab(name) {
+  let currentRole = null;
+
+  async function doLogin() {
+    try {
+      const role = document.getElementById('loginRole').value;
+      const passphrase = document.getElementById('loginPass').value;
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({role, passphrase})
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showResult('loginResult', data.error || 'login failed', true);
+        return;
+      }
+      currentRole = data.role;
+      document.getElementById('loginGate').style.display = 'none';
+      document.getElementById('dashboardRoot').style.display = 'block';
+      document.getElementById('roleLabel').textContent = currentRole;
+
+      if (data.role === 'trustee') {
+        document.getElementById('trusteeSecretLabel').textContent =
+          data.label || 'Unlabeled secret';
+      }
+
+      applyRoleVisibility(currentRole);
+      refreshStatus(); 
+    } catch (e) {
+      showResult('loginResult', e.message, true);
+    }
+  }
+
+  function doLogout() {
+    currentRole = null;
+    document.getElementById('dashboardRoot').style.display = 'none';
+    document.getElementById('loginGate').style.display = 'block';
+    document.getElementById('loginPass').value = '';
+  }
+
+  // Bug 5 fix: this only controls which panels are SHOWN. The real gate is
+  // server-side — _require_role() returns 401 for a hidden action even if
+  // it's called directly (e.g. via curl) without a matching session.
+  function applyRoleVisibility(role) {
+    document.querySelectorAll('[data-role]').forEach(el => {
+      const allowed = el.getAttribute('data-role').split(' ');
+      el.style.display = allowed.includes(role) ? '' : 'none';
+    });
+  }
+
+  function showTab(name) {
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     document.getElementById(name + 'Panel').classList.add('active');
@@ -1236,6 +1561,7 @@ VISUALIZER_HTML = """
     if (name === 'secrets') loadSecrets();
     if (name === 'chain') loadChain();
     if (name === 'trustees') loadTrustees();
+    if (name === 'poly' && !polyLoaded) loadPolyDemo();
   }
 
   async function api(path, body) {
@@ -1299,7 +1625,6 @@ VISUALIZER_HTML = """
     }
   }
   setInterval(refreshStatus, 1000);
-  refreshStatus();
 
   async function doArm() {
     try {
@@ -1435,7 +1760,8 @@ VISUALIZER_HTML = """
       showResult('encryptResult', r.encrypted_hex, false);
     } catch (e) { showResult('encryptResult', e.message, true); }
   }
-    async function doDecrypt() {
+
+  async function doDecrypt() {
     try {
       const body = {
         my_private: document.getElementById('decMyPrivate').value,
@@ -1492,32 +1818,41 @@ VISUALIZER_HTML = """
     }
   }
 
-  // ---------- Polynomial demo ----------
-  const P = 97, SECRET = 42;
-  function f(x) { return ((SECRET + 5*x + 3*x*x) % P + P) % P; }
-  const allPoints = [1,2,3,4,5].map(x => [x, f(x)]);
+  // ---------- Polynomial demo (Bug 4: now backed by real SSS output) ----------
+  let P = 97, SECRET = 42;
+  let allPoints = [];
   let revealed = [];
+  let polyLoaded = false;
 
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
-  
   const W = canvas.width, H = canvas.height, padding = 40;
 
-  function toScreen(x, y) {
-      return [padding + (x/6)*(W-2*padding), H-padding-(y/P)*(H-2*padding)];
+  async function loadPolyDemo() {
+    try {
+      const r = await api('/api/visualize-demo', { secret: SECRET, n: 5, k: 3 });
+      P = r.prime;
+      allPoints = r.shares;
+      revealed = [];
+      polyLoaded = true;
+      render();
+    } catch (e) {
+      document.getElementById('info').textContent = 'Could not load real demo data: ' + e.message;
+    }
   }
 
+  function toScreen(x, y) {
+    return [padding + (x/6)*(W-2*padding), H-padding-(y/P)*(H-2*padding)];
+  }
   function drawAxes() {
     ctx.strokeStyle = "#444"; ctx.beginPath();
     ctx.moveTo(padding, H-padding); ctx.lineTo(W-padding, H-padding);
     ctx.moveTo(padding, padding); ctx.lineTo(padding, H-padding); ctx.stroke();
   }
-
   function drawPoints() {
     ctx.fillStyle = "#5cf";
     for (const [x,y] of revealed) { const [sx,sy]=toScreen(x,y); ctx.beginPath(); ctx.arc(sx,sy,6,0,2*Math.PI); ctx.fill(); }
   }
-
   function lagrangeAt(x0, points) {
     let result = 0;
     for (let i=0;i<points.length;i++){
@@ -1527,7 +1862,6 @@ VISUALIZER_HTML = """
     }
     return result;
   }
-
   function drawCurve() {
     if (revealed.length < 3) return;
     ctx.strokeStyle="#9f5"; ctx.lineWidth=2; ctx.beginPath();
@@ -1539,26 +1873,23 @@ VISUALIZER_HTML = """
       if(first){ctx.moveTo(sx,sy);first=false;} else ctx.lineTo(sx,sy);
     }
     ctx.stroke();
-
     const [sx0,sy0]=toScreen(0,lagrangeAt(0,revealed));
     ctx.fillStyle="#fc5"; ctx.beginPath(); ctx.arc(sx0,sy0,7,0,2*Math.PI); ctx.fill();
   }
-
   function render() {
     ctx.clearRect(0,0,W,H); drawAxes(); drawPoints(); drawCurve();
     const info=document.getElementById('info');
-    if (revealed.length<3) info.textContent = `Shares revealed: ${revealed.length} / 3 needed.`;
+    if (!polyLoaded) { info.textContent = 'Loading real share data...'; return; }
+    if (revealed.length<3) info.textContent = `Shares revealed: ${revealed.length} / 3 needed. (real SSS output, p=${P})`;
     else info.textContent = `Curve reconstructed! f(0) = ${Math.round(lagrangeAt(0,revealed))} (the secret)`;
   }
-  function addNextPoint() { if(revealed.length<allPoints.length){revealed.push(allPoints[revealed.length]); render();} }
+  function addNextPoint() { if(polyLoaded && revealed.length<allPoints.length){revealed.push(allPoints[revealed.length]); render();} }
   function resetPoly() { revealed=[]; render(); }
-
-  render();
 </script>
 </body>
 </html>
 """
-
+POLY_DEMO_DATA = None
 
 class VisualizerHandler(http.server.BaseHTTPRequestHandler):
     """Serves the dashboard HTML and a JSON API that drives the same
@@ -1566,7 +1897,6 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
     reimplementation."""
 
     # ---------- GET ----------
-
     def do_GET(self):
         if self.path in ("/", ""):
             self._send_html(VISUALIZER_HTML)
@@ -1592,6 +1922,12 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "invalid JSON in request body"}, status=400)
             return
 
+        # Bug 5: server-side role gate, checked before any state-changing
+        # endpoint runs. /api/login and /api/visualize-demo aren't in
+        # ROLE_MAP so they always pass through.
+        if not _require_role(self, self.path):
+            return
+
         try:
             if self.path == "/api/split":
                 self._handle_split(data)
@@ -1615,12 +1951,17 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
                 self._handle_reconstruct(data)
             elif self.path == "/api/remove-trustee":
                 self._handle_remove_trustee(data)
+            elif self.path == "/api/login":
+                self._handle_login(data)
+            elif self.path == "/api/visualize-demo":
+                self._handle_visualize_demo(data)
             else:
                 self._send_json({"error": "unknown endpoint"}, status=404)
         except Exception as e:
             self._send_json({"error": str(e)}, status=400)
 
     # ---------- handlers (each mirrors the matching cli_* function) ----------
+    global POLY_DEMO_DATA
 
     def _handle_split(self, data):
         field = FiniteField()
@@ -1640,6 +1981,17 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         shares = sss.split(secret_int, n=n, k=k)
+        poly = sss.last_polynomial
+        POLY_DEMO_DATA = {
+            "label": label,
+            "n": n,
+            "k": k,
+            "prime": field.p,
+            "shares": shares,
+            "secret_int": secret_int,
+            "secret_length": len(secret_bytes),
+        }
+  
         canary_shares = trap.generate_canaries(canaries)
 
         audit_log("split", {"label": label, "n": n, "k": k, "canaries": canaries,
@@ -1661,16 +2013,53 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_add_trustee(self, data):
         state = load_state()
+
+        name = str(data["name"])
+        email = str(data["email"])
+        encrypted_hex = str(data["encrypted_hex"])
+        label = str(data["label"])
+
+        # Generate a unique login credential for this trustee
+        credential = secrets.token_urlsafe(12)
+
+        # Store only the hash, never the actual credential
+        salt = _get_or_create_auth_salt()
+        credential_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            credential.encode(),
+            salt,
+            100_000
+        ).hex()
+
         entry = {
-            "name": str(data["name"]),
-            "email": str(data["email"]),
-            "encrypted_share_hex": str(data["encrypted_hex"]),
-            "label": str(data["label"]),
+            "name": name,
+            "email": email,
+            "encrypted_share_hex": encrypted_hex,
+            "label": label,
+            "credential_hash": credential_hash,
         }
+
         state["trustees"].append(entry)
         save_state(state)
-        audit_log("add_trustee", {"name": entry["name"], "email": entry["email"], "label": entry["label"]})
-        self._send_json({"ok": True, "trustee": entry})
+
+        # Send the credential to the trustee
+        notify_trustee_credential(name, email, credential)
+
+        audit_log("add_trustee", {
+            "name": name,
+            "email": email,
+            "label": label
+        })
+
+        # Do NOT send credential back to browser
+        self._send_json({
+            "ok": True,
+            "trustee": {
+                "name": name,
+                "email": email,
+                "label": label
+            }
+        })
 
     def _handle_arm(self, data):
         state = load_state()
@@ -1758,7 +2147,7 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
             trustees = [t["name"] for t in state["trustees"] if t.get("label") == s["label"]]
             result.append({**s, "trustees": trustees})
         self._send_json({"secrets": result})
-        
+
     def _handle_watch_start(self, data):
         global _watch_thread, _watch_thread_stop
         if _watch_thread is not None and _watch_thread.is_alive():
@@ -1773,7 +2162,7 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
         global _watch_thread_stop
         _watch_thread_stop.set()
         self._send_json({"ok": True, "stopped": True})
-        
+
     def _handle_reconstruct(self, data):
         field = FiniteField()
         sss = ShamirSecretSharing(field)
@@ -1793,7 +2182,7 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"secret": recovered_bytes.decode("utf-8")})
         except UnicodeDecodeError:
             self._send_json({"secret": recovered_bytes.hex(), "raw_hex": True})
-            
+
     def _handle_remove_trustee(self, data):
         state = load_state()
         name = str(data["name"])
@@ -1808,6 +2197,94 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
         save_state(state)
         audit_log("remove_trustee", {"name": name, "label": label, "removed_count": removed})
         self._send_json({"ok": True, "removed": removed})
+
+    def _handle_login(self, data):
+        role = data.get("role")
+        passphrase = str(data.get("passphrase", ""))
+
+        if role not in ("owner", "trustee"):
+            audit_log("login_failed", {"role": role})
+            self._send_json(
+                {"error": "invalid role or passphrase"},
+                status=401
+            )
+            return
+
+        identity = _verify_passphrase(role, passphrase)
+
+        if not identity:
+            audit_log("login_failed", {"role": role})
+            self._send_json(
+                {"error": "invalid role or passphrase"},
+                status=401
+            )
+            return
+
+        token = _create_session(role)
+
+        # Keep track of which trustee actually logged in
+        if role == "trustee":
+            _sessions[token]["trustee_name"] = identity["trustee_name"]
+            _sessions[token]["trustee_email"] = identity["trustee_email"]
+            _sessions[token]["label"] = identity["label"]
+
+        audit_log("login", {
+            "role": role,
+            "trustee": identity.get("trustee_name")
+        })
+
+        cookie = SimpleCookie()
+        cookie["quorum_session"] = token
+        cookie["quorum_session"]["httponly"] = True
+        cookie["quorum_session"]["path"] = "/"
+        cookie["quorum_session"]["max-age"] = SESSION_TTL_SECONDS
+
+        body = json.dumps({
+            "ok": True,
+            "role": role,
+            "trustee_name": identity.get("trustee_name"),
+            "label": identity.get("label")
+        }).encode()
+
+        self.send_response(200)
+        self.send_header(
+            "Content-type",
+            "application/json; charset=utf-8"
+        )
+        self.send_header(
+            "Set-Cookie",
+            cookie["quorum_session"].OutputString()
+        )
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_visualize_demo(self, data):
+        global POLY_DEMO_DATA
+
+        if POLY_DEMO_DATA is None:
+            self._send_json(
+                {"error": "No secret has been split yet. Split a secret first."},
+                status=400
+            )
+            return
+
+        demo = POLY_DEMO_DATA
+
+        self._send_json({
+            "label": demo["label"],
+            "n": demo["n"],
+            "k": demo["k"],
+            "prime": str(demo["prime"]),
+            "shares": [
+                [str(x), str(y)]
+                for x, y in demo["shares"]
+            ],
+            "secret_length": demo["secret_length"],
+            "note": (
+                "These are the actual shares generated by Quorum's "
+                "ShamirSecretSharing implementation during the latest split."
+            )
+        })
 
     # ---------- response helpers ----------
 
@@ -1826,7 +2303,6 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
-
 
 # =============================================================================
 # CLI argument parser
@@ -1914,7 +2390,7 @@ def build_cli():
 
     showlog_parser = subparsers.add_parser("show-log", help="Print the audit log in human-readable form")
     showlog_parser.set_defaults(func=cli_show_log)
-    
+
     remove_trustee_parser = subparsers.add_parser("remove-trustee", help="Remove a trustee by name")
     remove_trustee_parser.add_argument("--name", required=True)
     remove_trustee_parser.add_argument("--label", default=None,
@@ -1946,14 +2422,13 @@ def _watch_loop_background():
             save_state(state)
 
         time.sleep(1)
-
-
 # =============================================================================
 # Entrypoint
 # =============================================================================
 
 if __name__ == "__main__":
     load_env_file()
+    ROLE_HASHES = _load_or_generate_passphrases()
     cli = build_cli()
     args = cli.parse_args()
     args.func(args)

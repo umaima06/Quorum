@@ -3,3 +3,4 @@ quorum_state.json
 quorum_mailbox.log
 quorum_audit.log
 __pycache__/
+quorum_auth_salt.bin

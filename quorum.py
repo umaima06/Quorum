@@ -961,7 +961,7 @@ def cli_split(args):
     if canaries:
         print("\nDecoy (canary) shares — do NOT use these to reconstruct:")
         for canary in canaries:
-                        print(" ", format_share(canary))
+            print(" ", format_share(canary))
 
 
 def cli_reconstruct(args):
@@ -2041,7 +2041,7 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({
             "label": label,
             "length": len(secret_bytes),
-                        "real_shares": [format_share(s) for s in shares],
+            "real_shares": [format_share(s) for s in shares],
             "canary_shares": [format_share(s) for s in canary_shares],
         })
 
@@ -2182,9 +2182,15 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
         self._send_json({"ok": True, "started": True})
 
     def _handle_watch_stop(self, data):
-        global _watch_thread_stop
+        global _watch_thread, _watch_thread_stop
+        if _watch_thread is None or not _watch_thread.is_alive():
+            self._send_json({"ok": True, "stopped": True, "already_stopped": True})
+            return
         _watch_thread_stop.set()
-        self._send_json({"ok": True, "stopped": True})
+        _watch_thread.join(timeout=2.0)
+        stopped_cleanly = not _watch_thread.is_alive()
+        _watch_thread = None
+        self._send_json({"ok": True, "stopped": stopped_cleanly})
 
     def _handle_reconstruct(self, data):
         field = FiniteField()

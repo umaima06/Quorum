@@ -33,11 +33,14 @@ Zero third-party runtime dependencies — Python standard library only.
   email via `smtplib`, with a safe local-log fallback) if it does.
 - **Owner/Trustee authentication** — the dashboard requires logging in
   with a role-specific passphrase. The server verifies the passphrase
-  and issues a session; the UI and the API endpoints both enforce role
-  (owner-only actions are rejected server-side for a trustee session,
-  not just hidden in the UI). Each trustee is issued their own
-  credential when they're registered, emailed to them, and reusable for
-  future logins.
+  and issues a session; the UI and *every* API endpoint enforce role
+  server-side, including read-only endpoints (status, audit log,
+  trustee list, secrets list) and the Polynomial Demo — not just the
+  state-changing ones, and not just hidden buttons in the UI. Login is
+  once per session (a cookie carries it across tabs and requests for up
+  to 4 hours) — you are not asked to re-authenticate per tab or per
+  action. Each trustee is issued their own credential when they're
+  registered, emailed to them, and reusable for future logins.
 - **A full local web dashboard** — split secrets, manage trustees,
   generate/encrypt/decrypt keys, watch the switch countdown live, and
   view the audit log's hash chain and a real polynomial-reconstruction
@@ -83,7 +86,10 @@ and role are enforced by the server, not just the UI.
 Note: sessions and the Polynomial Demo tab's current data are held in
 memory only — restarting the server clears them (you'll see "No secret
 has been split yet" on the demo tab after a restart even if you've
-split plenty before). This is expected behavior, not a bug.
+split plenty before). This is expected behavior, not a bug. The
+Polynomial Demo tab is clearly marked "🎓 Educational Demo" in the UI —
+it's a visualization aid, not the trustee reconstruction workflow, which
+lives in the Secrets tab and is labeled "🔐 Real reconstruction".
 
 ---
 
@@ -143,7 +149,16 @@ Without this file, notifications are written to `quorum_mailbox.log`
 instead — nothing breaks, no crash, no network dependency required.
 
 ---
+## A note on `http.server`
 
+The dashboard is served using Python's built-in `http.server`. Python's
+own documentation describes this module as suitable for local and demo
+use, not for production or public-facing deployment. That's an
+intentional fit here — Quorum's dashboard is meant to run locally, on
+the owner's or a trustee's own machine, never as a public-facing
+service — so this is the correct tool for the job, not a shortcut.
+
+---
 ## Zero-dependency proof
 
 ```bash

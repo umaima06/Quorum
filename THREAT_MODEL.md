@@ -26,7 +26,13 @@ plainly, what it protects against and what it does not.
   audit log hash-links every security-relevant event to the one before
   it. Altering any past entry breaks the chain, and `verify-log` detects
   exactly where.
-
+- **Unauthenticated access to the dashboard's data via direct API calls.**
+  Every API endpoint — including read-only ones like the switch status,
+  audit log, and trustee list, and the Polynomial Demo — requires a
+  valid owner or trustee session server-side (`_require_role`, checked
+  in both `do_GET` and `do_POST`). A `curl` call with no session gets a
+  401, the same as clicking a hidden button in the UI would.
+  
 ## What it does NOT protect against
 
 - **K or more trustees colluding.** By design, K shares are sufficient to

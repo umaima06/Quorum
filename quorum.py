@@ -921,28 +921,30 @@ def parse_share(share_str):
 
 def cli_split(args):
     """Split a secret into N shares (plus optional canaries) and print them."""
+    secret = args.secret.strip()
+    label = args.label.strip()
+    if not secret:
+        print("Error: secret cannot be empty or whitespace-only.")
+        return
+    if not label:
+        print("Error: --label cannot be empty or whitespace-only.")
+        return
+
     field = FiniteField()
     sss = ShamirSecretSharing(field)
     trap = CanaryTrap(field)
-
-    secret_bytes = args.secret.encode("utf-8")
+    secret_bytes = secret.encode("utf-8")
     secret_int = secret_to_int(secret_bytes)
-
     if secret_int >= field.p:
         print("Error: secret is too large for the current field. Aborting.")
         return
-
     shares = sss.split(secret_int, n=args.n, k=args.k)
     canaries = trap.generate_canaries(args.canaries)
-
-    audit_log("split", {"label": args.label, "n": args.n, "k": args.k, "canaries": args.canaries,
+    audit_log("split", {"label": label, "n": args.n, "k": args.k, "canaries": args.canaries,
                          "secret_length_bytes": len(secret_bytes)})
-
-    # Record what this secret IS, so it's never confused with another one
-    # split later (e.g. "Gmail password" vs "wallet seed phrase").
     state = load_state()
     state["secrets"].append({
-        "label": args.label,
+        "label": label,
         "n": args.n,
         "k": args.k,
         "canaries": args.canaries,
@@ -950,19 +952,16 @@ def cli_split(args):
         "timestamp": time.time(),
     })
     save_state(state)
-
-    print(f"=== Secret label: \"{args.label}\" ===")
+    print(f"=== Secret label: \"{label}\" ===")
     print(f"Split into {args.n} shares, threshold {args.k}.")
     print(f"(length={len(secret_bytes)} bytes — you'll need this AND the label to reconstruct)\n")
-
     print("Real shares:")
     for share in shares:
         print(" ", format_share(share))
-
     if canaries:
         print("\nDecoy (canary) shares — do NOT use these to reconstruct:")
         for canary in canaries:
-            print(" ", format_share(canary))
+                        print(" ", format_share(canary))
 
 
 def cli_reconstruct(args):
@@ -1996,58 +1995,53 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({"error": str(e)}, status=400)
 
-    # ---------- handlers (each mirrors the matching cli_* function) ----------
+        # ---------- handlers (each mirrors the matching cli_* function) ----------
 
     def _handle_split(self, data):
         global POLY_DEMO_DATA
+        secret = str(data["secret"]).strip()
+        label = str(data["label"]).strip()
+        if not secret:
+            self._send_json({"error": "secret cannot be empty or whitespace-only"}, status=400)
+            return
+        if not label:
+            self._send_json({"error": "label cannot be empty or whitespace-only"}, status=400)
+            return
 
         field = FiniteField()
         sss = ShamirSecretSharing(field)
         trap = CanaryTrap(field)
-
-        secret = str(data["secret"])
-        label = str(data["label"])
         n = int(data["n"])
         k = int(data["k"])
         canaries = int(data.get("canaries", 0))
-
         secret_bytes = secret.encode("utf-8")
         secret_int = secret_to_int(secret_bytes)
         if secret_int >= field.p:
             self._send_json({"error": "secret is too large for the current field"}, status=400)
             return
-
         shares = sss.split(secret_int, n=n, k=k)
         canary_shares = trap.generate_canaries(canaries)
-
-        # Bug 4: this split becomes the "latest" one the Polynomial Demo
-        # tab visualizes. Kept in server memory ONLY — never written to
-        # quorum_state.json, and the secret/exact shares are never sent
-        # to the browser (see _handle_visualize_demo).
         POLY_DEMO_DATA = {
             "label": label,
             "n": n,
             "k": k,
             "prime": field.p,
-            "shares": shares,          # real (x, y) ints
-            "secret_int": secret_int,  # kept server-side only, never sent
+            "shares": shares,
+            "secret_int": secret_int,
             "secret_length": len(secret_bytes),
         }
-
         audit_log("split", {"label": label, "n": n, "k": k, "canaries": canaries,
                              "secret_length_bytes": len(secret_bytes)})
-
         state = load_state()
         state["secrets"].append({
             "label": label, "n": n, "k": k, "canaries": canaries,
             "secret_length_bytes": len(secret_bytes), "timestamp": time.time(),
         })
         save_state(state)
-
         self._send_json({
             "label": label,
             "length": len(secret_bytes),
-            "real_shares": [format_share(s) for s in shares],
+                        "real_shares": [format_share(s) for s in shares],
             "canary_shares": [format_share(s) for s in canary_shares],
         })
 

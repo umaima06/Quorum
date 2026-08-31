@@ -20,21 +20,31 @@ plainly, what it protects against and what it does not.
 - **A trustee's inbox being compromised at any point after setup.** Shares
   are never emailed in plaintext. Each is encrypted using keys derived
   from a Diffie-Hellman exchange via PBKDF2-HMAC-SHA256 (separate
-  encryption and MAC keys, 100,000 iterations), with a counter-mode
-  keystream that never reuses a block. Every encrypted share carries an
-  HMAC-SHA256 tag, verified before decryption (encrypt-then-MAC) — a
-  tampered payload is refused outright, never silently decrypted into
-  garbage.
+  encryption and MAC keys, 100,000 iterations). Every encryption uses a
+  fresh random nonce, which is incorporated into the counter-mode
+  keystream derivation so the same keystream is not reused across
+  messages. The encrypted payload is authenticated with HMAC-SHA256
+  using encrypt-then-MAC, with the nonce included in the authenticated
+  data. A tampered payload is refused outright, never silently decrypted
+  into garbage.
 - **Silent tampering with the system's own history.** The Chain of Custody
   audit log hash-links every security-relevant event to the one before
   it. Altering any past entry breaks the chain, and `verify-log` detects
   exactly where.
+- **In-process state races between the dashboard and watcher.** Access to
+  the shared `quorum_state.json` state is guarded by a process-local
+  `threading.Lock`, preventing concurrent watcher and HTTP-handler
+  operations from racing on the same state. State writes use a temporary
+  file followed by `os.replace()` so the final state-file replacement is
+  atomic.
 - **Unauthenticated access to the dashboard's data.** Every API endpoint
   — including read-only ones like the switch status, audit log, trustee
   list, and Polynomial Demo — requires a valid owner or trustee session,
   enforced server-side (`_require_role`, checked on both GET and POST
   requests). A request with no valid session gets a 401, regardless of
-  whether the corresponding button is visible in the UI.
+  whether the corresponding button is visible in the UI. Session cookies
+  are marked `HttpOnly` and `SameSite=Lax`, reducing exposure to client-side
+  cookie access and basic cross-site request forgery scenarios.
 - **Login credentials stored in plaintext.** Neither the owner's
   passphrase nor any trustee's login credential is ever stored or
   compared as plaintext — both are hashed with PBKDF2-HMAC-SHA256 before
@@ -49,6 +59,12 @@ plainly, what it protects against and what it does not.
   returns only a success/failure message, never the recovered secret. It
   is also visually and functionally separated from the real trustee
   reconstruction workflow in the Secrets tab.
+- **In-process state races between the dashboard and watcher.** Access to
+  the shared `quorum_state.json` state is guarded by a process-local
+  `threading.Lock`, preventing concurrent watcher and HTTP-handler
+  operations from racing on the same state. State writes use
+  `os.replace()` for atomic file replacement, reducing the risk of a
+  partially written state file if a write is interrupted.
 - **The owner forgetting to check in.** `watch` sends the owner a single
   reminder once their window drops below 20% remaining, reducing the
   chance the switch fires by accident. This is a nudge to act, never an

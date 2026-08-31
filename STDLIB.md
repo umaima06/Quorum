@@ -19,6 +19,10 @@ and the standard-library feature we used instead.
 | A JSON/config library beyond the basics | `json` + `pathlib` | State persistence (`quorum_state.json`) and the audit log read/write straight through stdlib `json` and `pathlib`, no serialization package. |
 | A blockchain/audit-log package (e.g. for tamper-evident logging) | Hand-rolled hash-chained log (`hashlib.sha256`) | Chain of Custody links every log entry to the SHA-256 hash of the previous one — the same structural idea behind Certificate Transparency logs, built from a single stdlib hash function. |
 | A background job runner / scheduler library (e.g. `APScheduler`, or a separate worker process) | `threading.Thread(daemon=True)` + `threading.Event` | The dashboard's "Start Watching" / "Stop Watching" buttons control a background daemon thread in the same process (`_watch_loop_background`), with a clean stop signal (`_watch_thread_stop`) — instead of requiring a separate process manager or scheduling package. |
+| A thread-safety/concurrency library | `threading.Lock` | A shared lock guards access to `quorum_state.json` when the background watcher and dashboard HTTP handlers can read or modify state concurrently, preventing in-process read/write races. |
+| A transactional/atomic file-write library | `tempfile` + `os.replace()` | State is written to a temporary file and atomically replaced into place, reducing the risk of leaving `quorum_state.json` truncated or partially written if a write is interrupted. |
+| A thread-safety/concurrency library | `threading.Lock` | A shared lock guards access to `quorum_state.json` when the background watcher and dashboard HTTP handlers can read or modify state concurrently, preventing in-process read/write races. |
+| A transactional/atomic file-write library | `os.replace()` | State is written to a temporary file and atomically replaced into place, reducing the risk of leaving `quorum_state.json` truncated or partially written if a write is interrupted. |
 | A URL-opening/launcher utility | `webbrowser` | `quorum.py visualize` auto-opens the dashboard in the user's default browser after the local server starts, without shelling out to OS-specific commands. |
 
 ## Package Killer candidate
@@ -33,9 +37,16 @@ installed packages.
 ## A note on what we did *not* invent
 
 Per the "don't roll your own crypto" rule, we did not invent any new
-cryptographic primitive. Every construction above is a textbook, publicly
-vetted scheme (Shamir's Secret Sharing, 1979; Diffie-Hellman with RFC 3526
-Group 14 standard parameters; PBKDF2; HMAC; counter-mode-style keystream
-generation) — we implemented the *composition* of these ourselves from
-stdlib primitives, we did not design new math. This distinction is also
+cryptographic primitive. Every construction above is an established,
+publicly documented scheme or standard primitive (Shamir's Secret Sharing,
+1979; Diffie-Hellman with RFC 3526 Group 14 standard parameters; PBKDF2;
+HMAC; and nonce-based counter-mode-style keystream generation).
+
+We implemented the composition ourselves from stdlib primitives. The
+encrypted-share construction derives separate encryption and MAC keys
+with PBKDF2, generates a fresh random nonce for each encryption, incorporates
+that nonce into the keystream derivation, and authenticates the
+`nonce || ciphertext` payload with HMAC-SHA256.
+
+We did not design a new cryptographic primitive. This distinction is also
 covered in our threat model doc.

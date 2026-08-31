@@ -4,6 +4,7 @@
 === Every top-level import in quorum.py ===
 import argparse
 import hashlib
+import hmac
 import http.server
 import json
 import os
@@ -15,13 +16,14 @@ import sys
 import threading
 import time
 import webbrowser
+from http.cookies import SimpleCookie
 from email.message import EmailMessage
 from pathlib import Path
 
 === Each import checked against the Python 3 standard library ===
-All modules above (argparse, hashlib, http.server, json, os, secrets,
+All modules above (argparse, hashlib, hmac, http.server, json, os, secrets,
 smtplib, socketserver, ssl, sys, threading, time, webbrowser,
-email.message, pathlib) ship with CPython — see:
+email.message, http.cookies, pathlib) ship with CPython — see:
 https://docs.python.org/3/library/
 
 Note: 'pip list' is intentionally NOT used here — it reports every

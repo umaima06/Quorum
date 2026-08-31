@@ -19,9 +19,9 @@ deps-proof:
 	grep -E "^import|^from" quorum.py >> deps-proof.txt
 	@echo "" >> deps-proof.txt
 	@echo "=== Each import checked against the Python 3 standard library ===" >> deps-proof.txt
-	@echo "All modules above (argparse, hashlib, http.server, json, os, secrets," >> deps-proof.txt
-	@echo "smtplib, socketserver, ssl, sys, threading, time, webbrowser," >> deps-proof.txt
-	@echo "email.message, pathlib) ship with CPython — see:" >> deps-proof.txt
+	@echo "All modules above (argparse, hashlib, hmac, http.server, json, os," >> deps-proof.txt
+	@echo "secrets, smtplib, socketserver, ssl, sys, threading, time, webbrowser," >> deps-proof.txt
+	@echo "email.message, http.cookies, pathlib) ship with CPython — see:" >> deps-proof.txt
 	@echo "https://docs.python.org/3/library/" >> deps-proof.txt
 	@echo "" >> deps-proof.txt
 	@echo "Note: 'pip list' is intentionally NOT used here — it reports every" >> deps-proof.txt

@@ -12,9 +12,9 @@ audit log — so even the tool's own history can't be quietly rewritten.
 
 Track E — Security & Crypto Utilities.
 Zero third-party runtime dependencies — Python standard library only:
-    secrets, hashlib, http.server, socketserver, webbrowser, threading,
-    argparse, json, os, sys, time, smtplib, ssl, subprocess,
-    email.message, pathlib, http.cookies
+    secrets, hashlib, hmac, http.server, socketserver, webbrowser,
+    threading, argparse, json, os, sys, time, smtplib, ssl,
+    email.message, http.cookies, pathlib
 """
 
 # =============================================================================
@@ -819,18 +819,29 @@ def _log_to_mailbox(trustee, subject, body):
 
 def cli_add_trustee(args):
     """Register a trustee: name, email, their pre-encrypted share, and which
-    labeled secret that share is for — so a trustee holding shares for
-    multiple secrets never mixes them up."""
+    labeled secret that share is for. Also issues a dashboard login
+    credential, matching what the dashboard's own add-trustee form does —
+    so a trustee added via CLI can log into the dashboard too."""
     state = load_state()
+    
+    credential = secrets.token_urlsafe(12)
+    salt = _get_or_create_auth_salt()
+    credential_hash = hashlib.pbkdf2_hmac(
+        "sha256", credential.encode(), salt, 100_000
+    ).hex()
+
     state["trustees"].append({
         "name": args.name,
         "email": args.email,
         "encrypted_share_hex": args.encrypted_hex,
         "label": args.label,
+        "credential_hash": credential_hash,
     })
     save_state(state)
+    notify_trustee_credential(args.name, args.email, credential)
     audit_log("add_trustee", {"name": args.name, "email": args.email, "label": args.label})
     print(f"Added trustee: {args.name} <{args.email}> — share for: \"{args.label}\"")
+    print("Their dashboard login credential was emailed to them (or logged locally).")
 
 
 def cli_remove_trustee(args):
@@ -1204,15 +1215,26 @@ ROLE_MAP = {
     "/api/trustees": {"owner", "trustee"},
 }
 
+# Paths that intentionally require no session — you can't demand a login
+# to reach the login endpoint itself. Everything else is denied by
+# default unless explicitly listed in ROLE_MAP (fail-closed): a new
+# endpoint added later and forgotten here is unreachable, not wide open.
+PUBLIC_PATHS = {"/api/login"}
+
 
 def _require_role(handler, path):
     """
     Returns True if the request may proceed. Otherwise writes a 401 JSON
     response (via the handler's own _send_json) and returns False.
+    Fail-closed: any path not in PUBLIC_PATHS or ROLE_MAP is denied,
+    rather than silently allowed.
     """
+    if path in PUBLIC_PATHS:
+        return True
     required = ROLE_MAP.get(path)
     if required is None:
-        return True
+        handler._send_json({"error": "unknown or unauthorized endpoint"}, status=401)
+        return False
     role = _session_role(handler.headers.get("Cookie"))
     if role not in required:
         handler._send_json({"error": "unauthorized", "required_role": sorted(required)}, status=401)
@@ -2009,10 +2031,11 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": "invalid JSON in request body"}, status=400)
             return
 
-        # Bug 5: server-side role gate, checked before any state-changing
-        # endpoint runs. /api/login, /api/visualize-demo, and
-        # /api/visualize-demo/reconstruct aren't in ROLE_MAP so they
-        # always pass through.
+       # Server-side role gate, checked before any state-changing endpoint
+        # runs. Only /api/login is intentionally absent from ROLE_MAP (you
+        # can't require a session to reach the login endpoint itself) —
+        # every other endpoint, including /api/visualize-demo and
+        # /api/visualize-demo/reconstruct, requires a valid session.
         if not _require_role(self, self.path):
             return
 

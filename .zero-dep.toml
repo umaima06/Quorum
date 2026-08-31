@@ -1,0 +1,3 @@
+track = "E"
+track_name = "Security & Crypto Utilities"
+pitch = "A stdlib-only dead-man's-switch: split a secret into trustee shares via Shamir's Secret Sharing, distribute them with Diffie-Hellman-encrypted authenticated channels, and auto-notify trustees — with a tamper-evident audit log — if the owner ever stops checking in."

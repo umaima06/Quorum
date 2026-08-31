@@ -92,6 +92,23 @@ it's a visualization aid, not the trustee reconstruction workflow, which
 lives in the Secrets tab and is labeled "🔐 Real reconstruction".
 
 ---
+### First run — owner passphrase
+
+Quorum requires an owner passphrase to log into the dashboard. If you
+don't have a `quorum.env` file (e.g. a fresh clone), Quorum generates
+one automatically the first time you run any command, and prints it to
+the terminal:
+
+    [Quorum] No owner passphrase found in quorum.env — generated for this session:
+        QUORUM_OWNER_PASSPHRASE=<random value>
+
+Copy that value and use it to log in as **Owner** on the dashboard. This
+is only printed once per fresh session, and never committed or stored
+in the repo — it's generated locally, on your machine, at runtime.
+
+To keep the same passphrase across restarts, save it into a `quorum.env`
+file (see Configuration below) instead of letting a new one generate
+each time.
 
 ## CLI usage
 
@@ -189,8 +206,8 @@ complete, verifiable list of stdlib-only imports.
 the source is byte-identical across builds. We hashed the file twice,
 independently, and confirmed the outputs match:
 
-Build 1 SHA-256: `a0903ab6596e0ce60d229d2ff29b91df3d45ef9afd47807b684ece8148f729bf`
-Build 2 SHA-256: `a0903ab6596e0ce60d229d2ff29b91df3d45ef9afd47807b684ece8148f729bf`
+Build 1 SHA-256: `4a12df47aadf226c465c1a27d45fab4a601ff96b3672f5baca5cdc4c310ad17c`
+Build 2 SHA-256: `4a12df47aadf226c465c1a27d45fab4a601ff96b3672f5baca5cdc4c310ad17c`
 
 Reproduce this yourself:
 ```

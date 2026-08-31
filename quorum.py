@@ -1180,11 +1180,10 @@ def _session_role(cookie_header):
     return session["role"]
 
 
-# Which role(s) each state-changing endpoint requires. Read-only GET
-# endpoints (status/log/list-secrets/trustees) are left open so the
-# dashboard's live countdown and audit-log view work even pre-login.
-# /api/login, /api/visualize-demo, and /api/visualize-demo/reconstruct
-# aren't listed here, so they always pass through (see _require_role).
+# Which role(s) each endpoint requires — GET included. Only /api/login
+# passes through unauthenticated (see _require_role); everything else,
+# including read-only status/trustee/log views and the Polynomial Demo,
+# requires at least a logged-in session (owner or trustee).
 ROLE_MAP = {
     "/api/split": {"owner"},
     "/api/add-trustee": {"owner"},
@@ -1197,6 +1196,12 @@ ROLE_MAP = {
     "/api/reconstruct": {"trustee"},
     "/api/watch/start": {"owner"},
     "/api/watch/stop": {"owner"},
+    "/api/visualize-demo": {"owner", "trustee"},
+    "/api/visualize-demo/reconstruct": {"owner", "trustee"},
+    "/api/status": {"owner", "trustee"},
+    "/api/log": {"owner", "trustee"},
+    "/api/list-secrets": {"owner", "trustee"},
+    "/api/trustees": {"owner", "trustee"},
 }
 
 
@@ -1276,6 +1281,7 @@ VISUALIZER_HTML = """
     border-radius: 6px; font-family: monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
   .result.error { border-color: #a33; color: #f66; }
   .result.ok { border-color: #2a5f2a; color: #9f5; }
+  .result.demo { border-color: #6a4a9f; color: #c9f; }
   .share-line { padding: 4px 0; border-bottom: 1px solid #222; cursor: pointer; }
   .share-line:hover { color: #9f5; }
   .hint { font-size: 11px; color: #666; margin-top: 4px; }
@@ -1410,7 +1416,8 @@ VISUALIZER_HTML = """
         <div id="trusteeSecretLabel">—</div>
       </div>
       <div class="card" data-role="trustee">
-        <h3>Reconstruct a secret (trustees do this)</h3>
+        <h3>🔐 Real reconstruction (trustees do this)</h3>
+        <div class="hint">This is the actual trustee workflow — separate from the Polynomial Demo tab's educational visualization.</div>
         <label>Shares (one per line, format x:y)</label>
         <textarea id="reconShares" rows="4" placeholder="1:2322588...&#10;2:4645176..."></textarea>
         <label>Secret length in bytes (shown when it was split)</label>
@@ -1488,9 +1495,18 @@ VISUALIZER_HTML = """
 
     <!-- POLY -->
     <div id="polyPanel" class="panel">
+      <div style="text-align:center; margin-bottom:10px;">
+        <span style="display:inline-block; background:#2a1f3f; border:1px solid #6a4a9f;
+          color:#c9f; padding:4px 12px; border-radius:14px; font-size:12px; font-weight:600;">
+          🎓 Educational Demo
+        </span>
+      </div>
       <p style="text-align:center; color:#9fd;">
         This visualizes the <strong>real</strong> shares from the most recent
         <code>ShamirSecretSharing.split()</code> call — not a separate hardcoded example.
+        Reconstructing here is for illustration only and does not affect switch state
+        or trustee records. For the actual trustee workflow, use
+        <strong>Secrets → Reconstruct</strong>.
       </p>
       <p class="viz-caption">
         Values shown are normalized (scaled to 0–1) for display only, since the
@@ -1498,7 +1514,8 @@ VISUALIZER_HTML = """
         scaling never reveals the exact share value or the secret. Click points
         below to select shares, then reconstruct using Quorum's actual
         <code>reconstruct()</code> function server-side — not JavaScript
-        floating-point math.
+        floating-point math. The dashed line between selected points is a
+        visual aid to show which shares you've picked.
       </p>
       <canvas id="c" width="700" height="450"></canvas>
       <div id="info">Loading real share data...</div>
@@ -1589,6 +1606,13 @@ VISUALIZER_HTML = """
     el.textContent = text;
     el.className = 'result ' + (isError ? 'error' : 'ok');
   }
+
+  function showDemoResult(elId, text, isError) {
+    const el = document.getElementById(elId);
+    el.style.display = 'block';
+    el.textContent = text;
+    el.className = 'result ' + (isError ? 'error' : 'demo');
+  }
   
   function copyResult(elId) {
     const el = document.getElementById(elId);
@@ -1676,7 +1700,7 @@ VISUALIZER_HTML = """
       if (r.alert) {
         showResult('reconResult', '🚨 CANARY DETECTED: ' + r.alert, true);
       } else {
-        showResult('reconResult', 'Recovered secret: ' + r.secret, false);
+        showResult('reconResult', '🔐 [Real] Recovered secret: ' + r.secret, false);
       }
     } catch (e) { showResult('reconResult', e.message, true); }
   }
@@ -1870,6 +1894,27 @@ VISUALIZER_HTML = """
     ctx.moveTo(padding, H - padding); ctx.lineTo(W - padding, H - padding);
     ctx.moveTo(padding, padding); ctx.lineTo(padding, H - padding); ctx.stroke();
 
+    // Dashed lines between SELECTED points only — a visual aid showing
+    // which shares are chosen, drawn under the points. This is NOT the
+    // interpolating polynomial curve (which lives in GF(2^521-1) and
+    // can't be plotted on a 2D screen); see the caption above the canvas.
+    const selectedPts = polyPoints
+      .filter(p => polySelected.has(p.index))
+      .sort((a, b) => a.index - b.index);
+    if (selectedPts.length > 1) {
+      ctx.strokeStyle = "#fc5";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      selectedPts.forEach((p, i) => {
+        const [sx, sy] = toScreen(p.index, p.y_normalized);
+        if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1;
+    }
+
     polyPoints.forEach(p => {
       const [sx, sy] = toScreen(p.index, p.y_normalized);
       ctx.fillStyle = polySelected.has(p.index) ? "#fc5" : "#5cf";
@@ -1911,10 +1956,11 @@ VISUALIZER_HTML = """
       const indices = Array.from(polySelected);
       // Real reconstruction happens server-side via Quorum's actual
       // ShamirSecretSharing.reconstruct() — never JS floating-point math.
+      // Still labeled as the demo, since it doesn't touch switch/trustee state.
       const r = await api('/api/visualize-demo/reconstruct', { indices });
-      showResult('polyResult', r.message, !r.success);
+      showDemoResult('polyResult', '[Educational Demo] ' + r.message, !r.success);
     } catch (e) {
-      showResult('polyResult', e.message, true);
+      showDemoResult('polyResult', '[Educational Demo] ' + e.message, true);
     }
   }
 </script>
@@ -1932,7 +1978,16 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", ""):
             self._send_html(VISUALIZER_HTML)
-        elif self.path == "/api/log":
+            return
+
+        # Bug: these were previously left open "for the dashboard's
+        # pre-login countdown" — but they leak trustee emails, encrypted
+        # share hex, and full audit history to anyone who can reach the
+        # server. Now gated the same way as the POST endpoints.
+        if not _require_role(self, self.path):
+            return
+
+        if self.path == "/api/log":
             self._handle_get_log()
         elif self.path == "/api/status":
             self._send_json(load_state())

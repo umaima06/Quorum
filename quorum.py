@@ -49,6 +49,9 @@ from pathlib import Path
 SSS_PRIME = 2**521 - 1
 _watch_thread = None
 _watch_thread_stop = threading.Event()
+_state_lock = threading.Lock()  # guards load_state()/save_state() against
+                                  # concurrent access from the watcher thread
+                                  # and the HTTP handler thread
 
 # Standard 2048-bit MODP Diffie-Hellman group (RFC 3526, Group 14).
 # Publicly vetted parameters — not invented ourselves, per Track E's rules.
@@ -452,30 +455,46 @@ def cli_show_log(args):
 # =============================================================================
 
 def load_state():
-    """Load the persisted switch state, or return a fresh default if none exists."""
-    if not CONFIG_PATH.exists():
-        return {
-            "armed": False,
-            "days": None,
-            "demo_speed": False,
-            "last_checkin": None,
-            "trustees": [],   # [{ "name", "email", "encrypted_share_hex", "label", "credential_hash" }]
-            "secrets": [],    # [{ "label", "n", "k", "canaries", "secret_length_bytes", "timestamp" }]
-            "triggered": False,
-            "reminder_sent": False,
-        }
-    with open(CONFIG_PATH, "r") as f:
-        state = json.load(f)
-    # Backfill defaults for state files saved before these fields existed.
-    state.setdefault("secrets", [])
-    state.setdefault("reminder_sent", False)
-    return state
+    """Load the persisted switch state, or return a fresh default if none exists.
+
+    Guarded by _state_lock: the background watcher thread and the HTTP
+    handler thread both call this concurrently, and without a lock a read
+    can interleave with an in-progress write and see a truncated file.
+    """
+    with _state_lock:
+        if not CONFIG_PATH.exists():
+            return {
+                "armed": False,
+                "days": None,
+                "demo_speed": False,
+                "last_checkin": None,
+                "trustees": [],   # [{ "name", "email", "encrypted_share_hex", "label", "credential_hash" }]
+                "secrets": [],    # [{ "label", "n", "k", "canaries", "secret_length_bytes", "timestamp" }]
+                "triggered": False,
+                "reminder_sent": False,
+            }
+        with open(CONFIG_PATH, "r") as f:
+            state = json.load(f)
+        # Backfill defaults for state files saved before these fields existed.
+        state.setdefault("secrets", [])
+        state.setdefault("reminder_sent", False)
+        return state
 
 
 def save_state(state):
-    """Persist switch state to disk. Overwrites the previous file."""
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(state, f, indent=2)
+    """Persist switch state to disk atomically.
+
+    Guarded by _state_lock (same lock as load_state) so a concurrent read
+    from the watcher thread never sees a half-written file. Writes to a
+    temp file first, then os.replace()'s it into place — os.replace is
+    atomic on both POSIX and Windows, so a reader always sees either the
+    fully old file or the fully new one, never a partial write.
+    """
+    with _state_lock:
+        tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, CONFIG_PATH)
 
 
 # =============================================================================
@@ -2335,6 +2354,7 @@ class VisualizerHandler(http.server.BaseHTTPRequestHandler):
         cookie["quorum_session"] = token
         cookie["quorum_session"]["httponly"] = True
         cookie["quorum_session"]["path"] = "/"
+        cookie["quorum_session"]["samesite"] = "Lax"
         cookie["quorum_session"]["max-age"] = SESSION_TTL_SECONDS
 
         body = json.dumps({
